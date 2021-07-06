@@ -6,38 +6,46 @@ type Error = Box<dyn std::error::Error+Send+Sync+'static>;
 
 #[async_std::main]
 async fn main() -> Result<(),Error> {
-  let (args,argv) = argmap::parse(std::env::args());
+  let (_args,argv) = argmap::parse(std::env::args());
   let outdir = argv.get("o").or_else(|| argv.get("outdir"))
     .and_then(|xs| xs.first()).unwrap();
   let mut xq = XQ::open_from_path(&outdir).await?;
-  let pbf_file = args.first().unwrap();
+
+  let pbf_file = argv.get("i").or_else(|| argv.get("infile"))
+    .and_then(|xs| xs.first()).unwrap();
   let pbf = std::fs::File::open(pbf_file)?;
 
-  let (sender,receiver) = channel::bounded(100_000);
+  let (sender,receiver) = channel::bounded::<Vec<Feature>>(1_000);
   let mut work = vec![];
   work.push(task::spawn(async move {
-    while !receiver.is_closed() || !receiver.is_empty() {
-      let record = receiver.recv().await.unwrap();
-      xq.add_record(record).await.unwrap();
+    while let Ok(records) = receiver.recv().await {
+      let brs: Vec<Box<dyn Record>> = records.iter().map(|r| r.lift()).collect();
+      xq.add_records(&brs).await.unwrap();
     }
     xq.flush().await.unwrap();
   }));
   work.push(task::spawn(async move {
     let sc = sender.clone();
+    let mut records = vec![];
     osmpbf::ElementReader::new(pbf).for_each(move |element| {
       let s = sc.clone();
-      let record = Box::new(Feature::new(element));
-      task::block_on(async move {
-        s.send(record).await.unwrap();
-      });
-    });
+      records.push(Feature::new(element));
+      if records.len() >= 10_000 {
+        let rs = records.clone();
+        task::block_on(async move {
+          s.send(rs).await.unwrap();
+        });
+        records.clear();
+      }
+    }).unwrap();
+    println!["close"];
     sender.close();
   }));
   futures::future::join_all(work).await;
   Ok(())
 }
 
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 struct Feature {
   id: RecordId,
   refs: Vec<RecordId>,

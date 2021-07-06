@@ -1,3 +1,4 @@
+#![feature(hash_drain_filter)]
 use std::collections::HashMap;
 use lru::LruCache;
 use async_std::fs;
@@ -18,6 +19,7 @@ pub trait Record: Send+Sync {
   fn lift(&self) -> Box<dyn Record>;
 }
 
+#[derive(Debug)]
 pub enum QTree {
   Node { children: Vec<QTree>, bbox: BBox },
   Quad { id: QuadId, bbox: BBox },
@@ -44,10 +46,10 @@ pub struct XQ<S> where S: RW {
 impl<S> XQ<S> where S: RW {
   pub async fn new(storage: Box<dyn Storage<S>>) -> Result<Self,Error> {
     // todo: read tree from storage
-    Ok(Self {
+    let mut xq = Self {
       storage,
-      root: QTree::Node {
-        children: vec![],
+      root: QTree::Quad {
+        id: 0,
         bbox: (-180.0,-90.0,180.0,90.0),
       },
       stores: LruCache::new(500),
@@ -55,7 +57,9 @@ impl<S> XQ<S> where S: RW {
       quad_updates: HashMap::new(),
       id_cache: LruCache::new(10_000),
       id_updates: HashMap::new(),
-    })
+    };
+    xq.quad_updates.insert(0, vec![]);
+    Ok(xq)
   }
   pub async fn add_record(&mut self, record: Box<dyn Record>) -> Result<(),Error> {
     let id = record.get_id();
@@ -64,6 +68,25 @@ impl<S> XQ<S> where S: RW {
     self.quad_updates.get_mut(&q_id).map(|items| {
       items.push(record);
     });
+    // todo: if items.len() > threshold { split_quad() }
+    self.check_flush().await?;
+    Ok(())
+  }
+  pub async fn add_records(&mut self, records: &[Box<dyn Record>]) -> Result<(),Error> {
+    let qs = self.get_quads(&records).await?;
+    for (q_id,ix) in qs.iter() {
+      for i in ix {
+        let record = records.get(*i).unwrap();
+        let id = record.get_id();
+        self.id_updates.insert(id, *q_id);
+      }
+      let rs: Vec<_> = ix.iter().map(|i| {
+        records.get(*i).unwrap().lift()
+      }).collect();
+      self.quad_updates.get_mut(&q_id).map(|items| {
+        items.extend(rs);
+      });
+    }
     // todo: if items.len() > threshold { split_quad() }
     self.check_flush().await?;
     Ok(())
@@ -127,6 +150,46 @@ impl<S> XQ<S> where S: RW {
       }
     }
     Ok(None)
+  }
+  pub async fn get_quads(&mut self, records: &[Box<dyn Record>])
+  -> Result<HashMap<QuadId,Vec<usize>>,Error> {
+    let mut result: HashMap<QuadId,Vec<usize>> = HashMap::new();
+    let mut positions = HashMap::new();
+    for (i,r) in records.iter().enumerate() {
+      let p = self.get_position(r).await?.unwrap();
+      positions.insert(i,p);
+    }
+    let mut cursors = vec![&self.root];
+    let mut ncursors = vec![];
+    while !cursors.is_empty() {
+      ncursors.clear();
+      for c in cursors.iter() {
+        match c {
+          QTree::Node { children, .. } => {
+            ncursors.extend(children.iter()
+              .filter(|ch| {
+                positions.iter().any(|(_,p)| { overlap(p,&ch.bbox()) })
+              }).collect::<Vec<_>>());
+          },
+          QTree::Quad { id, bbox } => {
+            positions.drain_filter(|i,p| {
+              overlap(p,bbox) && {
+                if let Some(items) = result.get_mut(id) {
+                  items.push(*i);
+                } else {
+                  result.insert(*id, vec![*i]);
+                }
+                true
+              }
+            });
+          }
+        }
+      }
+      let tmp = ncursors;
+      ncursors = cursors;
+      cursors = tmp;
+    }
+    Ok(result)
   }
 }
 
