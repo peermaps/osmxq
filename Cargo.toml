@@ -1,0 +1,18 @@
+[package]
+name = "osmxq"
+version = "0.1.0"
+edition = "2018"
+
+[[bin]]
+name = "osmxq"
+path = "src/bin.rs"
+
+[dependencies]
+geohash = "0.11.0"
+osmpbf = "0.2.4"
+argmap = "1.1.1"
+desert = "1.0.3"
+lru = "0.6.5"
+async-std = { version = "1.9.0", features = ["attributes","unstable"] }
+async-trait = "0.1.48"
+futures = "0.3.13"
