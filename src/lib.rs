@@ -41,6 +41,7 @@ pub struct XQ<S> where S: RW {
   quad_updates: HashMap<QuadId,HashMap<RecordId,Box<dyn Record>>>,
   id_cache: LruCache<RecordId,QuadId>,
   id_updates: HashMap<RecordId,QuadId>,
+  missing_updates: Vec<Box<dyn Record>>,
   next_quad_id: QuadId,
 }
 
@@ -58,6 +59,7 @@ impl<S> XQ<S> where S: RW {
       quad_updates: HashMap::new(),
       id_cache: LruCache::new(10_000),
       id_updates: HashMap::new(),
+      missing_updates: vec![],
       next_quad_id: 1,
     };
     xq.quad_updates.insert(0, HashMap::new());
@@ -80,7 +82,7 @@ impl<S> XQ<S> where S: RW {
         item_len = items.len();
         println!["{}", items.len()];
       });
-      if item_len > 10_000 {
+      if item_len > 100_000 {
         self.split_quad(&q_id, &bbox).await?;
       }
     }
@@ -153,7 +155,7 @@ impl<S> XQ<S> where S: RW {
         let q = quads.get_mut(i).unwrap();
         q.1.insert(r_id,r);
       } else {
-        // todo: put in missing queue
+        self.missing_updates.push(r);
       }
     }
     let mut i = 0;
@@ -181,11 +183,10 @@ impl<S> XQ<S> where S: RW {
     let mut result: HashMap<QuadId,(BBox,Vec<usize>)> = HashMap::new();
     let mut positions = HashMap::new();
     for (i,r) in records.iter().enumerate() {
-      // todo: if None, put in processing queue
-      // keyed by missing id so when missing id is inserted
-      // this job starts up again
       if let Some(p) = self.get_position(r).await? {
         positions.insert(i,p);
+      } else {
+        self.missing_updates.push((*r).lift());
       }
     }
     let mut cursors = vec![&self.root];
@@ -221,6 +222,21 @@ impl<S> XQ<S> where S: RW {
       cursors = tmp;
     }
     Ok(result)
+  }
+  pub async fn finish(&mut self) -> Result<(),Error> {
+    let mut prev_len = self.missing_updates.len();
+    loop {
+      println!["missing.len()={}", prev_len];
+      let records = self.missing_updates.drain(..).collect::<Vec<_>>();
+      self.add_records(&records).await?;
+      let missing_len = self.missing_updates.len();
+      if missing_len == 0 || missing_len == prev_len {
+        break;
+      }
+      prev_len = self.missing_updates.len();
+    }
+    println!["skipped {}", self.missing_updates.len()];
+    Ok(())
   }
 }
 

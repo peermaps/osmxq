@@ -22,6 +22,7 @@ async fn main() -> Result<(),Error> {
       let brs: Vec<Box<dyn Record>> = records.iter().map(|r| r.lift()).collect();
       xq.add_records(&brs).await.unwrap();
     }
+    xq.finish().await.unwrap();
     xq.flush().await.unwrap();
   }));
   work.push(task::spawn(async move {
