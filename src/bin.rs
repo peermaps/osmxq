@@ -1,5 +1,6 @@
 #![feature(async_closure)]
 use async_std::{task,channel};
+use std::collections::HashMap;
 use osmxq::{XQ,Record,RecordId,Position};
 
 type Error = Box<dyn std::error::Error+Send+Sync+'static>;
@@ -19,8 +20,7 @@ async fn main() -> Result<(),Error> {
   let mut work = vec![];
   work.push(task::spawn(async move {
     while let Ok(records) = receiver.recv().await {
-      let brs: Vec<Box<dyn Record>> = records.iter().map(|r| r.lift()).collect();
-      xq.add_records(&brs).await.unwrap();
+      xq.add_records(&records).await.unwrap();
     }
     xq.finish().await.unwrap();
     xq.flush().await.unwrap();
@@ -89,7 +89,7 @@ impl Record for Feature {
   fn get_position(&self) -> Option<Position> {
     self.position
   }
-  fn lift(&self) -> Box<dyn Record> {
-    Box::new(Clone::clone(self))
+  fn pack(records: &HashMap<RecordId,Self>) -> Vec<u8> where Self: Sized {
+    vec![]
   }
 }

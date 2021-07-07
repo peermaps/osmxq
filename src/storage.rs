@@ -27,6 +27,7 @@ impl FileStorage {
 impl Storage<fs::File> for FileStorage {
   async fn open(&mut self, name: &str) -> Result<fs::File,Error> {
     let p = self.path.join(name);
+    fs::create_dir_all(p.parent().unwrap()).await?;
     Ok(fs::OpenOptions::new().read(true).write(true).create(true).open(p).await?)
   }
 }

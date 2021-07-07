@@ -12,11 +12,10 @@ pub type QuadId = u64;
 pub type RecordId = u64;
 pub type Error = Box<dyn std::error::Error+Send+Sync>;
 
-pub trait Record: Send+Sync+std::fmt::Debug {
+pub trait Record: Send+Sync+Clone+std::fmt::Debug {
   fn get_id(&self) -> RecordId;
   fn get_refs<'a>(&'a self) -> &'a [RecordId];
   fn get_position(&self) -> Option<Position>;
-  fn lift(&self) -> Box<dyn Record>;
   fn pack(records: &HashMap<RecordId,Self>) -> Vec<u8> where Self: Sized;
 }
 
@@ -34,19 +33,19 @@ impl QTree {
   }
 }
 
-pub struct XQ<S> where S: RW {
+pub struct XQ<S,R> where S: RW, R: Record {
   storage: Box<dyn Storage<S>>,
   stores: LruCache<String,S>,
   root: QTree,
-  quad_cache: LruCache<QuadId,HashMap<RecordId,Box<dyn Record>>>,
-  quad_updates: HashMap<QuadId,HashMap<RecordId,Box<dyn Record>>>,
+  quad_cache: LruCache<QuadId,HashMap<RecordId,R>>,
+  quad_updates: HashMap<QuadId,HashMap<RecordId,R>>,
   id_cache: LruCache<RecordId,QuadId>,
   id_updates: HashMap<RecordId,QuadId>,
-  missing_updates: Vec<Box<dyn Record>>,
+  missing_updates: Vec<R>,
   next_quad_id: QuadId,
 }
 
-impl<S> XQ<S> where S: RW {
+impl<S,R> XQ<S,R> where S: RW, R: Record {
   pub async fn new(storage: Box<dyn Storage<S>>) -> Result<Self,Error> {
     // todo: read tree from storage
     let mut xq = Self {
@@ -66,7 +65,7 @@ impl<S> XQ<S> where S: RW {
     xq.quad_updates.insert(0, HashMap::new());
     Ok(xq)
   }
-  pub async fn add_records(&mut self, records: &[Box<dyn Record>]) -> Result<(),Error> {
+  pub async fn add_records(&mut self, records: &[R]) -> Result<(),Error> {
     let qs = self.get_quads(&records).await?;
     for (q_id,(bbox,ix)) in qs.iter() {
       for i in ix {
@@ -77,8 +76,8 @@ impl<S> XQ<S> where S: RW {
       let mut item_len = 0;
       self.quad_updates.get_mut(&q_id).map(|items| {
         for i in ix {
-          let r = records.get(*i).unwrap().lift();
-          items.insert(r.get_id(), r);
+          let r = records.get(*i).unwrap();
+          items.insert(r.get_id(), r.clone());
         }
         item_len = items.len();
         println!["{}", items.len()];
@@ -107,12 +106,13 @@ impl<S> XQ<S> where S: RW {
     for (q_id,rs) in self.quad_updates.drain() {
       let qfile = quad_file(q_id);
       if let Some(s) = self.stores.get_mut(&qfile) {
-        s.write(&Record::pack(&rs)).await?;
+        s.write(&R::pack(&rs)).await?;
       } else {
         let mut s = self.storage.open(&qfile).await?;
-        s.write(&Record::pack(&rs)).await?;
+        s.write(&R::pack(&rs)).await?;
         self.stores.put(qfile, s);
       }
+      self.quad_cache.put(q_id,rs);
     }
     Ok(())
   }
@@ -125,7 +125,7 @@ impl<S> XQ<S> where S: RW {
     self.id_flush().await?;
     Ok(())
   }
-  pub async fn get_record(&mut self, id: RecordId) -> Result<Option<Box<dyn Record>>,Error> {
+  pub async fn get_record(&mut self, id: RecordId) -> Result<Option<R>,Error> {
     let q_id = match (self.id_updates.get(&id),self.id_cache.get(&id)) {
       (Some(q_id),_) => q_id,
       (_,Some(q_id)) => q_id,
@@ -133,16 +133,16 @@ impl<S> XQ<S> where S: RW {
       (None,None) => { return Ok(None) },
     };
     if let Some(records) = self.quad_updates.get(q_id) {
-      return Ok(records.get(&id).map(|r| (*r).lift()));
+      return Ok(records.get(&id).cloned());
     }
     if let Some(records) = self.quad_cache.get(q_id) {
-      return Ok(records.get(&id).map(|r| (*r).lift()));
+      return Ok(records.get(&id).cloned());
     }
     // todo: read from storage
     //unimplemented![]
     Ok(None)
   }
-  async fn get_position(&mut self, record: &Box<dyn Record>) -> Result<Option<Position>,Error> {
+  async fn get_position(&mut self, record: &R) -> Result<Option<Position>,Error> {
     if let Some(p) = record.get_position() { return Ok(Some(p)) }
     let refs = record.get_refs();
     if refs.is_empty() { return Ok(None) }
@@ -206,7 +206,7 @@ impl<S> XQ<S> where S: RW {
     self.check_flush().await?;
     Ok(())
   }
-  pub async fn get_quads(&mut self, records: &[Box<dyn Record>])
+  pub async fn get_quads(&mut self, records: &[R])
   -> Result<HashMap<QuadId,(BBox,Vec<usize>)>,Error> {
     let mut result: HashMap<QuadId,(BBox,Vec<usize>)> = HashMap::new();
     let mut positions = HashMap::new();
@@ -214,7 +214,7 @@ impl<S> XQ<S> where S: RW {
       if let Some(p) = self.get_position(r).await? {
         positions.insert(i,p);
       } else {
-        self.missing_updates.push((*r).lift());
+        self.missing_updates.push(r.clone());
       }
     }
     let mut cursors = vec![&self.root];
@@ -268,8 +268,8 @@ impl<S> XQ<S> where S: RW {
   }
 }
 
-impl XQ<fs::File> {
-  pub async fn open_from_path(path: &str) -> Result<XQ<fs::File>,Error> {
+impl<R> XQ<fs::File,R> where R: Record {
+  pub async fn open_from_path(path: &str) -> Result<XQ<fs::File,R>,Error> {
     Ok(Self::new(Box::new(FileStorage::open_from_path(path).await?)).await?)
   }
 }
