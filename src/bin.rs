@@ -38,7 +38,6 @@ async fn main() -> Result<(),Error> {
         records.clear();
       }
     }).unwrap();
-    println!["close"];
     sender.close();
   }));
   futures::future::join_all(work).await;
