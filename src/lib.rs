@@ -63,17 +63,6 @@ impl<S> XQ<S> where S: RW {
     xq.quad_updates.insert(0, vec![]);
     Ok(xq)
   }
-  pub async fn add_record(&mut self, record: Box<dyn Record>) -> Result<(),Error> {
-    let id = record.get_id();
-    let q_id = self.get_quad(&record).await?.unwrap();
-    self.id_updates.insert(id, q_id);
-    self.quad_updates.get_mut(&q_id).map(|items| {
-      items.push(record);
-    });
-    // todo: if items.len() > threshold { split_quad() }
-    self.check_flush().await?;
-    Ok(())
-  }
   pub async fn add_records(&mut self, records: &[Box<dyn Record>]) -> Result<(),Error> {
     let qs = self.get_quads(&records).await?;
     for (q_id,(bbox,ix)) in qs.iter() {
@@ -186,28 +175,6 @@ impl<S> XQ<S> where S: RW {
     }
     self.check_flush().await?;
     Ok(())
-  }
-  pub async fn get_quad(&mut self, record: &Box<dyn Record>) -> Result<Option<QuadId>,Error> {
-    let pos = {
-      let p = self.get_position(record).await?;
-      if p.is_none() { return Ok(None) }
-      p.unwrap()
-    };
-    let mut c = &self.root;
-    loop {
-      match c {
-        QTree::Node { children, .. } => {
-          let o_n = children.iter().find(|ch| overlap(&pos,&ch.bbox()));
-          if let Some(n) = o_n {
-            c = n;
-          } else {
-            break;
-          }
-        },
-        QTree::Quad { id, .. } => { return Ok(Some(*id)) }
-      }
-    }
-    Ok(None)
   }
   pub async fn get_quads(&mut self, records: &[Box<dyn Record>])
   -> Result<HashMap<QuadId,(BBox,Vec<usize>)>,Error> {
