@@ -1,7 +1,7 @@
 #![feature(hash_drain_filter)]
 use std::collections::HashMap;
 use lru::LruCache;
-use async_std::fs;
+use async_std::{prelude::*,fs};
 
 mod storage;
 use storage::{Storage,FileStorage,RW};
@@ -17,6 +17,7 @@ pub trait Record: Send+Sync+std::fmt::Debug {
   fn get_refs<'a>(&'a self) -> &'a [RecordId];
   fn get_position(&self) -> Option<Position>;
   fn lift(&self) -> Box<dyn Record>;
+  fn pack(records: &HashMap<RecordId,Self>) -> Vec<u8> where Self: Sized;
 }
 
 #[derive(Debug)]
@@ -90,11 +91,38 @@ impl<S> XQ<S> where S: RW {
     Ok(())
   }
   pub async fn check_flush(&mut self) -> Result<(),Error> {
-    // todo: call flush() if over a threshold of updates
+    if self.quad_updates.len() >= 100_000 && self.id_updates.len() >= 100_000 {
+      // todo: parallel io
+      self.quad_flush().await?;
+      self.id_flush().await?;
+    } else if self.quad_updates.len() >= 100_000 {
+      self.quad_flush().await?;
+    } else if self.id_updates.len() >= 100_000 {
+      self.id_flush().await?;
+    }
+    Ok(())
+  }
+  pub async fn quad_flush(&mut self) -> Result<(),Error> {
+    // todo: parallel io
+    for (q_id,rs) in self.quad_updates.drain() {
+      let qfile = quad_file(q_id);
+      if let Some(s) = self.stores.get_mut(&qfile) {
+        s.write(&Record::pack(&rs)).await?;
+      } else {
+        let mut s = self.storage.open(&qfile).await?;
+        s.write(&Record::pack(&rs)).await?;
+        self.stores.put(qfile, s);
+      }
+    }
+    Ok(())
+  }
+  pub async fn id_flush(&mut self) -> Result<(),Error> {
     Ok(())
   }
   pub async fn flush(&mut self) -> Result<(),Error> {
-    // todo: write to storage and clear updates and cache
+    // todo: parallel io
+    self.quad_flush().await?;
+    self.id_flush().await?;
     Ok(())
   }
   pub async fn get_record(&mut self, id: RecordId) -> Result<Option<Box<dyn Record>>,Error> {
@@ -248,4 +276,7 @@ impl XQ<fs::File> {
 
 fn overlap(p: &Position, bbox: &BBox) -> bool {
   p.0 >= bbox.0 && p.0 <= bbox.2 && p.1 >= bbox.1 && p.1 <= bbox.3
+}
+fn quad_file(q_id: QuadId) -> String {
+  format!["q/{:02x}/{:x}",q_id%256,q_id/256]
 }
