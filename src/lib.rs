@@ -37,8 +37,8 @@ pub struct XQ<S> where S: RW {
   storage: Box<dyn Storage<S>>,
   stores: LruCache<String,S>,
   root: QTree,
-  quad_cache: LruCache<QuadId,Vec<Box<dyn Record>>>,
-  quad_updates: HashMap<QuadId,Vec<Box<dyn Record>>>,
+  quad_cache: LruCache<QuadId,HashMap<RecordId,Box<dyn Record>>>,
+  quad_updates: HashMap<QuadId,HashMap<RecordId,Box<dyn Record>>>,
   id_cache: LruCache<RecordId,QuadId>,
   id_updates: HashMap<RecordId,QuadId>,
   next_quad_id: QuadId,
@@ -60,7 +60,7 @@ impl<S> XQ<S> where S: RW {
       id_updates: HashMap::new(),
       next_quad_id: 1,
     };
-    xq.quad_updates.insert(0, vec![]);
+    xq.quad_updates.insert(0, HashMap::new());
     Ok(xq)
   }
   pub async fn add_records(&mut self, records: &[Box<dyn Record>]) -> Result<(),Error> {
@@ -71,12 +71,12 @@ impl<S> XQ<S> where S: RW {
         let id = record.get_id();
         self.id_updates.insert(id, *q_id);
       }
-      let rs: Vec<_> = ix.iter().map(|i| {
-        records.get(*i).unwrap().lift()
-      }).collect();
       let mut item_len = 0;
       self.quad_updates.get_mut(&q_id).map(|items| {
-        items.extend(rs);
+        for i in ix {
+          let r = records.get(*i).unwrap().lift();
+          items.insert(r.get_id(), r);
+        }
         item_len = items.len();
         println!["{}", items.len()];
       });
@@ -103,10 +103,10 @@ impl<S> XQ<S> where S: RW {
       (None,None) => { return Ok(None) },
     };
     if let Some(records) = self.quad_updates.get(q_id) {
-      return Ok(records.iter().find(|r| r.get_id() == id).map(|r| (*r).lift()));
+      return Ok(records.get(&id).map(|r| (*r).lift()));
     }
     if let Some(records) = self.quad_cache.get(q_id) {
-      return Ok(records.iter().find(|r| r.get_id() == id).map(|r| (*r).lift()));
+      return Ok(records.get(&id).map(|r| (*r).lift()));
     }
     // todo: read from storage
     //unimplemented![]
@@ -144,14 +144,14 @@ impl<S> XQ<S> where S: RW {
           bbox.0 + ((i+1) as f32/(nx as f32))*(bbox.2-bbox.0),
           bbox.1 + ((j+1) as f32/(nx as f32))*(bbox.3-bbox.1),
         );
-        quads.push((b,vec![]));
+        quads.push((b,HashMap::new()));
       }
     }
-    for r in records {
+    for (r_id,r) in records {
       if let Some(p) = self.get_position(&r).await? {
         let i = quads.iter().position(|(b,_)| overlap(&p, &b)).unwrap();
         let q = quads.get_mut(i).unwrap();
-        q.1.push(r.lift());
+        q.1.insert(r_id,r);
       } else {
         // todo: put in missing queue
       }
@@ -159,15 +159,15 @@ impl<S> XQ<S> where S: RW {
     let mut i = 0;
     for q in quads {
       if i == 0 {
-        for r in q.1.iter() {
-          self.id_updates.insert(r.get_id(), *q_id);
+        for (r_id,_) in q.1.iter() {
+          self.id_updates.insert(*r_id, *q_id);
         }
         self.quad_updates.insert(*q_id, q.1);
       } else {
         let id = self.next_quad_id;
         self.next_quad_id += 1;
-        for r in q.1.iter() {
-          self.id_updates.insert(r.get_id(), id);
+        for (r_id,_) in q.1.iter() {
+          self.id_updates.insert(*r_id, id);
         }
         self.quad_updates.insert(id, q.1);
       }
