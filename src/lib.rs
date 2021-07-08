@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use lru::LruCache;
 use async_std::{prelude::*,fs};
+use desert::varint;
 
 mod storage;
 use storage::{Storage,FileStorage,RW};
@@ -10,6 +11,7 @@ pub type Position = (f32,f32);
 pub type BBox = (f32,f32,f32,f32);
 pub type QuadId = u64;
 pub type RecordId = u64;
+pub type IdBlock = u64;
 pub type Error = Box<dyn std::error::Error+Send+Sync>;
 
 pub trait Record: Send+Sync+Clone+std::fmt::Debug {
@@ -40,8 +42,8 @@ pub struct XQ<S,R> where S: RW, R: Record {
   root: QTree,
   quad_cache: LruCache<QuadId,HashMap<RecordId,R>>,
   quad_updates: HashMap<QuadId,HashMap<RecordId,R>>,
-  id_cache: LruCache<RecordId,QuadId>,
-  id_updates: HashMap<RecordId,QuadId>,
+  id_cache: LruCache<IdBlock,HashMap<RecordId,QuadId>>,
+  id_updates: HashMap<IdBlock,HashMap<RecordId,QuadId>>,
   missing_updates: Vec<R>,
   next_quad_id: QuadId,
 }
@@ -66,13 +68,38 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     xq.quad_updates.insert(0, HashMap::new());
     Ok(xq)
   }
+  async fn insert_id(&mut self, id: RecordId, q_id: QuadId) -> Result<(),Error> {
+    let b = id_block(id);
+    let ifile = id_file(id);
+    if let Some(ids) = self.id_updates.get_mut(&b) {
+      ids.insert(id, q_id);
+    } else if let Some(mut ids) = self.id_cache.pop(&b) {
+      ids.insert(id, q_id);
+      self.id_updates.insert(b, ids);
+    } else if let Some(s) = self.stores.get_mut(&ifile) {
+      let mut buf = Vec::new();
+      s.read_to_end(&mut buf).await?;
+      let mut ids = unpack_ids(&buf)?;
+      ids.insert(id, q_id);
+      self.id_updates.insert(b, ids);
+      self.id_cache.pop(&b);
+    } else {
+      let mut s = self.storage.open(&ifile).await?;
+      let mut buf = Vec::new();
+      s.read_to_end(&mut buf).await?;
+      let mut ids = unpack_ids(&buf)?;
+      ids.insert(id, q_id);
+      self.id_updates.insert(b, ids);
+      self.stores.put(ifile, s);
+    }
+    Ok(())
+  }
   pub async fn add_records(&mut self, records: &[R]) -> Result<(),Error> {
     let qs = self.get_quads(&records).await?;
     for (q_id,(bbox,ix)) in qs.iter() {
       for i in ix {
         let record = records.get(*i).unwrap();
-        let id = record.get_id();
-        self.id_updates.insert(id, *q_id);
+        self.insert_id(record.get_id(), *q_id).await?;
       }
       let mut item_len = 0;
       self.quad_updates.get_mut(&q_id).map(|items| {
@@ -104,13 +131,14 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   }
   pub async fn quad_flush(&mut self) -> Result<(),Error> {
     // todo: parallel io
+    // todo: lock quad_updates
     for (q_id,rs) in self.quad_updates.drain() {
       let qfile = quad_file(q_id);
       if let Some(s) = self.stores.get_mut(&qfile) {
-        s.write(&R::pack(&rs)).await?;
+        s.write_all(&R::pack(&rs)).await?;
       } else {
         let mut s = self.storage.open(&qfile).await?;
-        s.write(&R::pack(&rs)).await?;
+        s.write_all(&R::pack(&rs)).await?;
         self.stores.put(qfile, s);
       }
       self.quad_cache.put(q_id,rs);
@@ -118,6 +146,19 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     Ok(())
   }
   pub async fn id_flush(&mut self) -> Result<(),Error> {
+    // todo: lock id_updates
+    eprintln!["id_updates.len()={}", self.id_updates.len()];
+    for (b,ids) in self.id_updates.drain() {
+      let ifile = id_file_from_block(b);
+      if let Some(s) = self.stores.get_mut(&ifile) {
+        s.write_all(&pack_ids(&ids)).await?;
+      } else {
+        let mut s = self.storage.open(&ifile).await?;
+        s.write_all(&pack_ids(&ids)).await?;
+        self.stores.put(ifile, s);
+      }
+      self.id_cache.put(b,ids);
+    }
     Ok(())
   }
   pub async fn flush(&mut self) -> Result<(),Error> {
@@ -127,21 +168,46 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     Ok(())
   }
   pub async fn get_record(&mut self, id: RecordId) -> Result<Option<R>,Error> {
-    let q_id = match (self.id_updates.get(&id),self.id_cache.get(&id)) {
-      (Some(q_id),_) => q_id,
-      (_,Some(q_id)) => q_id,
-      //(None,None) => unimplemented![], // todo: read from storage
-      (None,None) => { return Ok(None) },
+    let b = id_block(id);
+    let mut o_q_id = self.id_updates.get(&b).and_then(|ids| ids.get(&id));
+    if o_q_id.is_none() {
+      o_q_id = self.id_cache.get(&b).and_then(|ids| ids.get(&id));
+    }
+    let q_id = if let Some(q_id) = o_q_id { *q_id } else {
+      let ifile = id_file(id);
+      let mut buf = Vec::new();
+      if let Some(s) = self.stores.get_mut(&ifile) {
+        s.read_to_end(&mut buf).await?;
+      } else {
+        let mut s = self.storage.open(&ifile).await?;
+        s.read_to_end(&mut buf).await?;
+        self.stores.put(ifile, s);
+      };
+      let ids = unpack_ids(&buf)?;
+      let g = ids.get(&id).copied();
+      self.id_cache.put(b, ids);
+      if g.is_none() { return Ok(None) }
+      g.unwrap()
     };
-    if let Some(records) = self.quad_updates.get(q_id) {
+    if let Some(records) = self.quad_updates.get(&q_id) {
       return Ok(records.get(&id).cloned());
     }
-    if let Some(records) = self.quad_cache.get(q_id) {
+    if let Some(records) = self.quad_cache.get(&q_id) {
       return Ok(records.get(&id).cloned());
     }
-    // todo: read from storage
-    //unimplemented![]
-    Ok(None)
+    let qfile = quad_file(q_id);
+    let mut buf = Vec::new();
+    if let Some(s) = self.stores.get_mut(&qfile) {
+      s.read_to_end(&mut buf).await?;
+    } else {
+      let mut s = self.storage.open(&qfile).await?;
+      s.read_to_end(&mut buf).await?;
+      self.stores.put(qfile, s);
+    }
+    let records = R::unpack(&buf)?;
+    let r = records.get(&id).cloned();
+    self.quad_cache.put(q_id, records);
+    Ok(r)
   }
   async fn get_position(&mut self, record: &R) -> Result<Option<Position>,Error> {
     if let Some(p) = record.get_position() { return Ok(Some(p)) }
@@ -191,14 +257,14 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     for q in quads {
       if i == 0 {
         for (r_id,_) in q.1.iter() {
-          self.id_updates.insert(*r_id, *q_id);
+          self.insert_id(*r_id, *q_id).await?;
         }
         self.quad_updates.insert(*q_id, q.1);
       } else {
         let id = self.next_quad_id;
         self.next_quad_id += 1;
         for (r_id,_) in q.1.iter() {
-          self.id_updates.insert(*r_id, id);
+          self.insert_id(*r_id, id).await?;
         }
         self.quad_updates.insert(id, q.1);
       }
@@ -280,4 +346,48 @@ fn overlap(p: &Position, bbox: &BBox) -> bool {
 }
 fn quad_file(q_id: QuadId) -> String {
   format!["q/{:02x}/{:x}",q_id%256,q_id/256]
+}
+fn id_file(id: RecordId) -> String {
+  let b = id_block(id);
+  format!["i/{:02x}/{:x}",b%256,b/256]
+}
+fn id_file_from_block(b: IdBlock) -> String {
+  format!["i/{:02x}/{:x}",b%256,b/256]
+}
+fn id_block(id: RecordId) -> IdBlock {
+  id/100_000
+}
+fn id_range(b: IdBlock) -> (RecordId,RecordId) {
+  (b*100_000,(b+1)*100_000)
+}
+fn unpack_ids(buf: &[u8]) -> Result<HashMap<RecordId,QuadId>,Error> {
+  let mut records = HashMap::new();
+  if buf.is_empty() { return Ok(records) }
+  let mut offset = 0;
+  let (s,len) = varint::decode(&buf[offset..])?;
+  offset += s;
+  for _ in 0..len {
+    let (s,r_id) = varint::decode(&buf[offset..])?;
+    offset += s;
+    let (s,q_id) = varint::decode(&buf[offset..])?;
+    offset += s;
+    records.insert(r_id, q_id);
+  }
+  Ok(records)
+}
+fn pack_ids(records: &HashMap<RecordId,QuadId>) -> Vec<u8> {
+  let mut size = 0;
+  size += varint::length(records.len() as u64);
+  for (r_id,q_id) in records {
+    size += varint::length(*r_id);
+    size += varint::length(*q_id);
+  }
+  let mut buf = vec![0;size];
+  let mut offset = 0;
+  offset += varint::encode(records.len() as u64, &mut buf[offset..]).unwrap();
+  for (r_id,q_id) in records {
+    offset += varint::encode(*r_id, &mut buf[offset..]).unwrap();
+    offset += varint::encode(*q_id, &mut buf[offset..]).unwrap();
+  }
+  buf
 }

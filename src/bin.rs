@@ -114,6 +114,7 @@ impl Record for Feature {
   }
   fn unpack(buf: &[u8]) -> Result<HashMap<RecordId,Self>,Error> where Self: Sized {
     let mut records = HashMap::new();
+    if buf.is_empty() { return Ok(records) }
     let mut offset = 0;
     let (s,record_len) = varint::decode(&buf[offset..])?;
     offset += s;
