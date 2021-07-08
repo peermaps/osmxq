@@ -41,7 +41,7 @@ pub struct XQ<S,R> where S: RW, R: Record {
   stores: LruCache<String,S>,
   root: QTree,
   quad_cache: LruCache<QuadId,HashMap<RecordId,R>>,
-  quad_updates: HashMap<QuadId,HashMap<RecordId,R>>,
+  quad_updates: HashMap<QuadId,Option<HashMap<RecordId,R>>>,
   id_cache: LruCache<IdBlock,HashMap<RecordId,QuadId>>,
   id_updates: HashMap<IdBlock,HashMap<RecordId,QuadId>>,
   missing_updates: Vec<R>,
@@ -63,7 +63,7 @@ impl Default for Fields {
   fn default() -> Self {
     Self {
       id_block_size: 500_000,
-      quad_block_size: 100_000,
+      quad_block_size: 50_000,
       store_cache_size: 5_000,
       id_cache_size: 2_000,
       quad_cache_size: 1_000,
@@ -94,7 +94,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       next_quad_id: 1,
       fields,
     };
-    xq.quad_updates.insert(0, HashMap::new());
+    xq.quad_updates.insert(0, None);
     Ok(xq)
   }
   async fn insert_id(&mut self, id: RecordId, q_id: QuadId) -> Result<(),Error> {
@@ -131,7 +131,11 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         self.insert_id(record.get_id(), *q_id).await?;
       }
       let mut item_len = 0;
-      self.quad_updates.get_mut(&q_id).map(|items| {
+      self.quad_updates.get_mut(&q_id).map(|o_items| {
+        if o_items.is_none() {
+          *o_items = Some(HashMap::new());
+        }
+        let items = o_items.as_mut().unwrap();
         for i in ix {
           let r = records.get(*i).unwrap();
           items.insert(r.get_id(), r.clone());
@@ -158,7 +162,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   pub async fn quad_flush(&mut self) -> Result<(),Error> {
     // todo: parallel io
     // todo: lock quad_updates
-    for (q_id,rs) in self.quad_updates.drain() {
+    for (q_id,o_rs) in self.quad_updates.drain() {
+      if o_rs.is_none() { continue }
+      let rs = o_rs.unwrap();
       let qfile = quad_file(q_id);
       if let Some(s) = self.stores.get_mut(&qfile) {
         s.write_all(&R::pack(&rs)).await?;
@@ -216,7 +222,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       g.unwrap()
     };
     if let Some(records) = self.quad_updates.get(&q_id) {
-      return Ok(records.get(&id).cloned());
+      return Ok(records.as_ref().and_then(|items| items.get(&id).cloned()));
     }
     if let Some(records) = self.quad_cache.get(&q_id) {
       return Ok(records.get(&id).cloned());
@@ -253,7 +259,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   pub async fn split_quad(&mut self, q_id: &QuadId, bbox: &BBox) -> Result<(),Error> {
     // todo: lock quad_updates and quad_cache?
     let records = match (self.quad_updates.remove(q_id),self.quad_cache.pop(q_id)) {
-      (Some(rs),_) => rs,
+      (Some(Some(rs)),_) => rs,
+      (Some(None),_) => panic!["tried to split an empty quad"],
       (_,Some(rs)) => rs,
       (None,None) => {
         let qfile = quad_file(*q_id);
@@ -296,14 +303,22 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         for (r_id,_) in q.1.iter() {
           self.insert_id(*r_id, *q_id).await?;
         }
-        self.quad_updates.insert(*q_id, q.1);
+        if q.1.is_empty() {
+          self.quad_updates.insert(*q_id, None);
+        } else {
+          self.quad_updates.insert(*q_id, Some(q.1));
+        }
       } else {
         let id = self.next_quad_id;
         self.next_quad_id += 1;
         for (r_id,_) in q.1.iter() {
           self.insert_id(*r_id, id).await?;
         }
-        self.quad_updates.insert(id, q.1);
+        if q.1.is_empty() {
+          self.quad_updates.insert(id, None);
+        } else {
+          self.quad_updates.insert(id, Some(q.1));
+        }
       }
       i += 1;
     }
