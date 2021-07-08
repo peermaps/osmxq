@@ -46,10 +46,38 @@ pub struct XQ<S,R> where S: RW, R: Record {
   id_updates: HashMap<IdBlock,HashMap<RecordId,QuadId>>,
   missing_updates: Vec<R>,
   next_quad_id: QuadId,
+  fields: Fields,
+}
+
+pub struct Fields {
+  id_block_size: usize,
+  quad_block_size: usize,
+  id_cache_size: usize,
+  quad_cache_size: usize,
+  store_cache_size: usize,
+  id_flush_size: usize,
+  quad_flush_size: usize,
+}
+
+impl Default for Fields {
+  fn default() -> Self {
+    Self {
+      id_block_size: 500_000,
+      quad_block_size: 100_000,
+      store_cache_size: 5_000,
+      id_cache_size: 2_000,
+      quad_cache_size: 1_000,
+      id_flush_size: 500,
+      quad_flush_size: 500,
+    }
+  }
 }
 
 impl<S,R> XQ<S,R> where S: RW, R: Record {
   pub async fn new(storage: Box<dyn Storage<S>>) -> Result<Self,Error> {
+    Self::from_fields(storage, Fields::default()).await
+  }
+  pub async fn from_fields(storage: Box<dyn Storage<S>>, fields: Fields) -> Result<Self,Error> {
     // todo: read tree from storage
     let mut xq = Self {
       storage,
@@ -57,20 +85,21 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         id: 0,
         bbox: (-180.0,-90.0,180.0,90.0),
       },
-      stores: LruCache::new(500),
-      quad_cache: LruCache::new(10_000),
+      stores: LruCache::new(fields.store_cache_size),
+      quad_cache: LruCache::new(fields.quad_cache_size),
       quad_updates: HashMap::new(),
-      id_cache: LruCache::new(10_000),
+      id_cache: LruCache::new(fields.id_cache_size),
       id_updates: HashMap::new(),
       missing_updates: vec![],
       next_quad_id: 1,
+      fields,
     };
     xq.quad_updates.insert(0, HashMap::new());
     Ok(xq)
   }
   async fn insert_id(&mut self, id: RecordId, q_id: QuadId) -> Result<(),Error> {
-    let b = id_block(id);
-    let ifile = id_file(id);
+    let b = self.id_block(id);
+    let ifile = self.id_file(id);
     if let Some(ids) = self.id_updates.get_mut(&b) {
       ids.insert(id, q_id);
     } else if let Some(mut ids) = self.id_cache.pop(&b) {
@@ -108,9 +137,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           items.insert(r.get_id(), r.clone());
         }
         item_len = items.len();
-        println!["{}", items.len()];
       });
-      if item_len > 100_000 {
+      if item_len > self.fields.quad_block_size {
         self.split_quad(&q_id, &bbox).await?;
       }
     }
@@ -118,13 +146,11 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     Ok(())
   }
   pub async fn check_flush(&mut self) -> Result<(),Error> {
-    if self.quad_updates.len() >= 100_000 && self.id_updates.len() >= 100_000 {
-      // todo: parallel io
+    // todo: parallel io
+    if self.quad_updates.len() >= self.fields.quad_flush_size {
       self.quad_flush().await?;
-      self.id_flush().await?;
-    } else if self.quad_updates.len() >= 100_000 {
-      self.quad_flush().await?;
-    } else if self.id_updates.len() >= 100_000 {
+    }
+    if self.id_updates.len() >= self.fields.id_flush_size {
       self.id_flush().await?;
     }
     Ok(())
@@ -168,13 +194,13 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     Ok(())
   }
   pub async fn get_record(&mut self, id: RecordId) -> Result<Option<R>,Error> {
-    let b = id_block(id);
+    let b = self.id_block(id);
     let mut o_q_id = self.id_updates.get(&b).and_then(|ids| ids.get(&id));
     if o_q_id.is_none() {
       o_q_id = self.id_cache.get(&b).and_then(|ids| ids.get(&id));
     }
     let q_id = if let Some(q_id) = o_q_id { *q_id } else {
-      let ifile = id_file(id);
+      let ifile = self.id_file(id);
       let mut buf = Vec::new();
       if let Some(s) = self.stores.get_mut(&ifile) {
         s.read_to_end(&mut buf).await?;
@@ -229,7 +255,18 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let records = match (self.quad_updates.remove(q_id),self.quad_cache.pop(q_id)) {
       (Some(rs),_) => rs,
       (_,Some(rs)) => rs,
-      (None,None) => unimplemented![], // todo: read from storage
+      (None,None) => {
+        let qfile = quad_file(*q_id);
+        let mut buf = Vec::new();
+        if let Some(s) = self.stores.get_mut(&qfile) {
+          s.read_to_end(&mut buf).await?;
+        } else {
+          let mut s = self.storage.open(&qfile).await?;
+          s.read_to_end(&mut buf).await?;
+          self.stores.put(qfile, s);
+        }
+        R::unpack(&buf)?
+      },
     };
     let (nx,ny) = (4,4);
     let mut quads = vec![];
@@ -333,6 +370,13 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     println!["skipped {}", self.missing_updates.len()];
     Ok(())
   }
+  fn id_block(&self, id: RecordId) -> IdBlock {
+    id/(self.fields.id_block_size as u64)
+  }
+  fn id_file(&self, id: RecordId) -> String {
+    let b = self.id_block(id);
+    format!["i/{:02x}/{:x}",b%256,b/256]
+  }
 }
 
 impl<R> XQ<fs::File,R> where R: Record {
@@ -347,18 +391,8 @@ fn overlap(p: &Position, bbox: &BBox) -> bool {
 fn quad_file(q_id: QuadId) -> String {
   format!["q/{:02x}/{:x}",q_id%256,q_id/256]
 }
-fn id_file(id: RecordId) -> String {
-  let b = id_block(id);
-  format!["i/{:02x}/{:x}",b%256,b/256]
-}
 fn id_file_from_block(b: IdBlock) -> String {
   format!["i/{:02x}/{:x}",b%256,b/256]
-}
-fn id_block(id: RecordId) -> IdBlock {
-  id/100_000
-}
-fn id_range(b: IdBlock) -> (RecordId,RecordId) {
-  (b*100_000,(b+1)*100_000)
 }
 fn unpack_ids(buf: &[u8]) -> Result<HashMap<RecordId,QuadId>,Error> {
   let mut records = HashMap::new();

@@ -32,7 +32,7 @@ async fn main() -> Result<(),Error> {
     osmpbf::ElementReader::new(pbf).for_each(move |element| {
       let s = sc.clone();
       records.push(Feature::new(element));
-      if records.len() >= 10_000 {
+      if records.len() >= 100_000 {
         let rs = records.clone();
         task::block_on(async move {
           s.send(rs).await.unwrap();
