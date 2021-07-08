@@ -17,6 +17,7 @@ pub trait Record: Send+Sync+Clone+std::fmt::Debug {
   fn get_refs<'a>(&'a self) -> &'a [RecordId];
   fn get_position(&self) -> Option<Position>;
   fn pack(records: &HashMap<RecordId,Self>) -> Vec<u8> where Self: Sized;
+  fn unpack(buf: &[u8]) -> Result<HashMap<RecordId,Self>,Error>;
 }
 
 #[derive(Debug)]

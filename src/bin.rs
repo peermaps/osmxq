@@ -2,6 +2,7 @@
 use async_std::{task,channel};
 use std::collections::HashMap;
 use osmxq::{XQ,Record,RecordId,Position};
+use desert::{varint,ToBytes,FromBytes,CountBytes};
 
 type Error = Box<dyn std::error::Error+Send+Sync+'static>;
 
@@ -90,6 +91,46 @@ impl Record for Feature {
     self.position
   }
   fn pack(records: &HashMap<RecordId,Self>) -> Vec<u8> where Self: Sized {
-    vec![]
+    let mut size = 0;
+    size += varint::length(records.len() as u64);
+    for (r_id,r) in records {
+      let xid = r_id*2 + if r.position.is_some() { 1 } else { 0 };
+      size += varint::length(xid);
+      size += r.position.map(|p| p.count_bytes()).unwrap_or(0);
+      size += r.refs.count_bytes();
+    }
+    let mut buf = vec![0u8;size];
+    let mut offset = 0;
+    offset += varint::encode(records.len() as u64, &mut buf[offset..]).unwrap();
+    for (r_id,r) in records {
+      let xid = r_id*2 + if r.position.is_some() { 1 } else { 0 };
+      offset += varint::encode(xid, &mut buf[offset..]).unwrap();
+      if let Some(p) = r.position {
+        offset += p.write_bytes(&mut buf[offset..]).unwrap();
+      }
+      offset += r.refs.write_bytes(&mut buf[offset..]).unwrap();
+    }
+    buf
+  }
+  fn unpack(buf: &[u8]) -> Result<HashMap<RecordId,Self>,Error> where Self: Sized {
+    let mut records = HashMap::new();
+    let mut offset = 0;
+    let (s,record_len) = varint::decode(&buf[offset..])?;
+    offset += s;
+    for _ in 0..record_len {
+      let (s,xid) = varint::decode(&buf[offset..])?;
+      offset += s;
+      let id = xid/2;
+      let mut position = None;
+      if xid % 2 == 1 {
+        let (s,p) = Position::from_bytes(&buf[offset..])?;
+        offset += s;
+        position = Some(p);
+      }
+      let (s,refs) = <Vec<RecordId>>::from_bytes(&buf[offset..])?;
+      offset += s;
+      records.insert(id, Self { id, refs, position });
+    }
+    Ok(records)
   }
 }
