@@ -1,4 +1,4 @@
-#![feature(async_closure)]
+#![feature(async_closure,backtrace)]
 use async_std::{task,channel};
 use std::collections::HashMap;
 use osmxq::{XQ,Record,RecordId,Position};
@@ -21,25 +21,25 @@ async fn main() -> Result<(),Error> {
   let mut work = vec![];
   work.push(task::spawn(async move {
     while let Ok(records) = receiver.recv().await {
-      xq.add_records(&records).await.unwrap();
+      wrap_err(xq.add_records(&records).await.map_err(|e| e.into()));
     }
-    xq.finish().await.unwrap();
-    xq.flush().await.unwrap();
+    wrap_err(xq.finish().await.map_err(|e| e.into()));
+    wrap_err(xq.flush().await.map_err(|e| e.into()));
   }));
   work.push(task::spawn(async move {
     let sc = sender.clone();
     let mut records = vec![];
-    osmpbf::ElementReader::new(pbf).for_each(move |element| {
+    wrap_err(osmpbf::ElementReader::new(pbf).for_each(move |element| {
       let s = sc.clone();
       records.push(Feature::new(element));
       if records.len() >= 100_000 {
         let rs = records.clone();
         task::block_on(async move {
-          s.send(rs).await.unwrap();
+          wrap_err(s.send(rs).await.map_err(|e| e.into()));
         });
         records.clear();
       }
-    }).unwrap();
+    }).map_err(|e| e.into()));
     sender.close();
   }));
   futures::future::join_all(work).await;
@@ -133,5 +133,20 @@ impl Record for Feature {
       records.insert(id, Self { id, refs, position });
     }
     Ok(records)
+  }
+}
+
+fn wrap_err<T>(r: Result<T,Error>) {
+  match r {
+    Err(err) => {
+      match err.backtrace().map(|bt| (bt,bt.status())) {
+        Some((bt,std::backtrace::BacktraceStatus::Captured)) => {
+          eprint!["{}\n{}", err, bt];
+        },
+        _ => eprintln!["{}", err],
+      }
+      std::process::exit(1);
+    },
+    Ok(_) => {},
   }
 }

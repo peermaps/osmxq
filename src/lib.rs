@@ -168,9 +168,11 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       let qfile = quad_file(q_id);
       if let Some(s) = self.stores.get_mut(&qfile) {
         s.write_all(&R::pack(&rs)).await?;
+        s.flush().await?;
       } else {
         let mut s = self.storage.open(&qfile).await?;
         s.write_all(&R::pack(&rs)).await?;
+        s.flush().await?;
         self.stores.put(qfile, s);
       }
       self.quad_cache.put(q_id,rs);
@@ -184,9 +186,11 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       let ifile = id_file_from_block(b);
       if let Some(s) = self.stores.get_mut(&ifile) {
         s.write_all(&pack_ids(&ids)).await?;
+        s.flush().await?;
       } else {
         let mut s = self.storage.open(&ifile).await?;
         s.write_all(&pack_ids(&ids)).await?;
+        s.flush().await?;
         self.stores.put(ifile, s);
       }
       self.id_cache.put(b,ids);
