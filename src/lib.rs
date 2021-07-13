@@ -6,7 +6,6 @@ use desert::varint;
 
 mod storage;
 use storage::{Storage,FileStorage,RW};
-mod unfold;
 
 pub type Position = (f32,f32);
 pub type BBox = (f32,f32,f32,f32);
@@ -14,8 +13,6 @@ pub type QuadId = u64;
 pub type RecordId = u64;
 pub type IdBlock = u64;
 pub type Error = Box<dyn std::error::Error+Send+Sync>;
-
-pub type DenormRecordStream<R> = Box<dyn Stream<Item=(R,Vec<R>)>+Send+Unpin>;
 
 pub trait Record: Send+Sync+Clone+std::fmt::Debug {
   fn get_id(&self) -> RecordId;
@@ -47,6 +44,7 @@ pub struct XQ<S,R> where S: RW, R: Record {
   quad_cache: LruCache<QuadId,HashMap<RecordId,R>>,
   quad_updates: Arc<RwLock<HashMap<QuadId,Option<HashMap<RecordId,R>>>>>,
   next_quad_id: QuadId,
+  // todo: quad_id_cache
   id_cache: LruCache<IdBlock,HashMap<RecordId,QuadId>>,
   id_updates: Arc<RwLock<HashMap<IdBlock,HashMap<RecordId,QuadId>>>>,
   missing_updates: HashMap<RecordId,R>,
@@ -106,7 +104,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     };
     Ok(xq)
   }
-  fn get_quad_ids(&self) -> Vec<QuadId> {
+  pub fn get_quad_ids(&self) -> Vec<QuadId> {
     let mut cursors = vec![&self.root];
     let mut ncursors = vec![];
     let mut quad_ids = vec![];
@@ -128,12 +126,40 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     }
     quad_ids
   }
-  pub async fn denorm_record_stream(&mut self) -> DenormRecordStream<R> {
-    let quad_ids = self.get_quad_ids();
-    let state = ();
-    Box::new(unfold::unfold(state, async move |mut qs| {
-      unimplemented![]
-    }))
+  pub async fn read_quad(&mut self, q_id: QuadId) -> Result<HashMap<RecordId,R>,Error> {
+    if let Some(Some(records)) = self.quad_updates.read().await.get(&q_id) {
+      return Ok(records.clone());
+    }
+    if let Some(records) = self.quad_cache.get(&q_id) {
+      return Ok(records.clone());
+    }
+    let qfile = quad_file(q_id);
+    let mut s = self.open_file(&qfile).await?;
+    let mut buf = vec![];
+    s.read_to_end(&mut buf).await?;
+    let records = R::unpack(&buf)?;
+    self.quad_cache.put(q_id, records.clone());
+    self.close_file(&qfile);
+    Ok(records)
+  }
+  pub async fn read_denorm_quad(&mut self, q_id: QuadId) -> Result<Vec<(RecordId,R,Vec<R>)>,Error> {
+    let records = self.read_quad(q_id).await?;
+    let rlen = records.len();
+    let mut result = Vec::with_capacity(rlen);
+    for (id,record) in records.iter() {
+      let refs = record.get_refs();
+      let mut denorm = Vec::with_capacity(refs.len());
+      for r_id in refs {
+        if let Some(r) = records.get(r_id) {
+          denorm.push(r.clone());
+        } else if let Some(r) = self.get_record(*r_id).await? {
+          denorm.push(r);
+        }
+        // else the ref is missing
+      }
+      result.push((*id,record.clone(),denorm));
+    }
+    Ok(result)
   }
   async fn insert_id(&mut self, id: RecordId, q_id: QuadId) -> Result<(),Error> {
     let b = self.id_block(id);
@@ -154,7 +180,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         self.id_updates.write().await.insert(b, ids);
         return Ok(());
       }
-      let mut buf = Vec::new();
+      let mut buf = vec![];
       s.read_to_end(&mut buf).await?;
       let mut ids = unpack_ids(&buf)?;
       ids.insert(id, q_id);
@@ -258,7 +284,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     }
     let q_id = if let Some(q_id) = o_q_id { q_id } else {
       let ifile = self.id_file(id);
-      let mut buf = Vec::new();
+      let mut buf = vec![];
       let mut s = self.open_file(&ifile).await?;
       s.read_to_end(&mut buf).await?;
       let ids = unpack_ids(&buf)?;
@@ -275,7 +301,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       return Ok(records.get(&id).cloned());
     }
     let qfile = quad_file(q_id);
-    let mut buf = Vec::new();
+    let mut buf = vec![];
     let mut s = self.open_file(&qfile).await?;
     s.read_to_end(&mut buf).await?;
     let records = R::unpack(&buf)?;
@@ -311,7 +337,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         (Some(None),_) => panic!["tried to split an empty quad"],
         (_,Some(rs)) => rs,
         (None,None) => {
-          let mut buf = Vec::new();
+          let mut buf = vec![];
           s.read_to_end(&mut buf).await?;
           R::unpack(&buf)?
         },
@@ -440,7 +466,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       for i in missing_start..missing_end {
         let mfile = missing_file(i);
         println!["i={} mfile={}", i, &mfile];
-        let mut buf = Vec::new();
+        let mut buf = vec![];
         {
           let mut s = self.open_file(&mfile).await?;
           s.read_to_end(&mut buf).await?;
