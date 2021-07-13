@@ -218,15 +218,6 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     Ok(())
   }
   pub async fn get_record(&mut self, id: RecordId) -> Result<Option<R>,Error> {
-    /*
-    // todo: see if this is faster
-    for (_,records) in self.quad_updates.read().await.iter() {
-      if let Some(r) = records.get(&id) { return Ok(Some(r)) }
-    }
-    for (_,records) in self.quad_cache.read().await.iter() {
-      if let Some(r) = records.get(&id) { return Ok(Some(r)) }
-    }
-    */
     let b = self.id_block(id);
     let mut o_q_id = self.id_updates.read().await.get(&b).and_then(|ids| ids.get(&id).copied());
     if o_q_id.is_none() {
