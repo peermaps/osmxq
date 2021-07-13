@@ -1,4 +1,4 @@
-#![feature(hash_drain_filter)]
+#![feature(hash_drain_filter,async_closure)]
 use std::collections::HashMap;
 use lru::LruCache;
 use async_std::{prelude::*,fs,sync::{RwLock,Arc,Mutex}};
@@ -6,6 +6,7 @@ use desert::varint;
 
 mod storage;
 use storage::{Storage,FileStorage,RW};
+mod unfold;
 
 pub type Position = (f32,f32);
 pub type BBox = (f32,f32,f32,f32);
@@ -13,6 +14,8 @@ pub type QuadId = u64;
 pub type RecordId = u64;
 pub type IdBlock = u64;
 pub type Error = Box<dyn std::error::Error+Send+Sync>;
+
+pub type DenormRecordStream<R> = Box<dyn Stream<Item=(R,Vec<R>)>+Send+Unpin>;
 
 pub trait Record: Send+Sync+Clone+std::fmt::Debug {
   fn get_id(&self) -> RecordId;
@@ -102,6 +105,35 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       fields,
     };
     Ok(xq)
+  }
+  fn get_quad_ids(&self) -> Vec<QuadId> {
+    let mut cursors = vec![&self.root];
+    let mut ncursors = vec![];
+    let mut quad_ids = vec![];
+    while !cursors.is_empty() {
+      ncursors.clear();
+      for c in cursors.iter() {
+        match c {
+          QTree::Node { children, .. } => {
+            ncursors.extend(children)
+          },
+          QTree::Quad { id, .. } => {
+            quad_ids.push(*id);
+          },
+        }
+      }
+      let tmp = ncursors;
+      ncursors = cursors;
+      cursors = tmp;
+    }
+    quad_ids
+  }
+  pub async fn denorm_record_stream(&mut self) -> DenormRecordStream<R> {
+    let quad_ids = self.get_quad_ids();
+    let state = ();
+    Box::new(unfold::unfold(state, async move |mut qs| {
+      unimplemented![]
+    }))
   }
   async fn insert_id(&mut self, id: RecordId, q_id: QuadId) -> Result<(),Error> {
     let b = self.id_block(id);
