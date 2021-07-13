@@ -36,6 +36,7 @@ impl QTree {
   }
 }
 
+// todo: backrefs
 pub struct XQ<S,R> where S: RW, R: Record {
   storage: Mutex<Box<dyn Storage<S>>>,
   active_files: HashMap<String,Arc<Mutex<()>>>,
@@ -427,15 +428,12 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       missing_start = missing_end;
     }
     self.missing_count = 0;
-    // todo: delete missing files
-    /*
     {
-      let st = self.storage.lock().await;
+      let mut st = self.storage.lock().await;
       for i in 0..self.next_missing_id {
         st.remove(&missing_file(i)).await?;
       }
     }
-    */
     Ok(())
   }
   fn id_block(&self, id: RecordId) -> IdBlock {
