@@ -2,10 +2,12 @@
 use std::collections::HashMap;
 use lru::LruCache;
 use async_std::{prelude::*,fs,sync::{RwLock,Arc,Mutex}};
-use desert::varint;
+use desert::{varint,ToBytes,FromBytes};
 
 mod storage;
 use storage::{Storage,FileStorage,RW};
+mod meta;
+use meta::Meta;
 
 pub type Position = (f32,f32);
 pub type BBox = (f32,f32,f32,f32);
@@ -22,7 +24,7 @@ pub trait Record: Send+Sync+Clone+std::fmt::Debug {
   fn unpack(buf: &[u8]) -> Result<HashMap<RecordId,Self>,Error>;
 }
 
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub enum QTree {
   Node { children: Vec<QTree>, bbox: BBox },
   Quad { id: QuadId, bbox: BBox },
@@ -81,28 +83,52 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   pub async fn open(storage: Box<dyn Storage<S>>) -> Result<Self,Error> {
     Self::from_fields(storage, Fields::default()).await
   }
-  pub async fn from_fields(storage: Box<dyn Storage<S>>, fields: Fields) -> Result<Self,Error> {
-    // todo: read tree from storage
-    let mut quad_updates = HashMap::new();
-    quad_updates.insert(0, None);
-    let xq = Self {
-      storage: Mutex::new(storage),
-      root: QTree::Quad {
-        id: 0,
-        bbox: (-180.0,-90.0,180.0,90.0),
-      },
-      active_files: HashMap::new(),
-      quad_cache: LruCache::new(fields.quad_cache_size),
-      quad_updates: Arc::new(RwLock::new(quad_updates)),
-      id_cache: LruCache::new(fields.id_cache_size),
-      id_updates: Arc::new(RwLock::new(HashMap::new())),
-      missing_updates: HashMap::new(),
-      missing_count: 0,
-      next_quad_id: 1,
-      next_missing_id: 0,
-      fields,
-    };
-    Ok(xq)
+  pub async fn from_fields(mut storage: Box<dyn Storage<S>>, mut fields: Fields) -> Result<Self,Error> {
+    let mfile = "meta".to_string();
+    let mut s = storage.open(&mfile).await?;
+    let mut buf = vec![];
+    s.read_to_end(&mut buf).await?;
+
+    if buf.is_empty() {
+      let mut quad_updates = HashMap::new();
+      quad_updates.insert(0, None);
+      let xq = Self {
+        storage: Mutex::new(storage),
+        root: QTree::Quad {
+          id: 0,
+          bbox: (-180.0,-90.0,180.0,90.0),
+        },
+        active_files: HashMap::new(),
+        quad_cache: LruCache::new(fields.quad_cache_size),
+        quad_updates: Arc::new(RwLock::new(quad_updates)),
+        id_cache: LruCache::new(fields.id_cache_size),
+        id_updates: Arc::new(RwLock::new(HashMap::new())),
+        missing_updates: HashMap::new(),
+        missing_count: 0,
+        next_quad_id: 1,
+        next_missing_id: 0,
+        fields,
+      };
+      Ok(xq)
+    } else {
+      let (_,meta) = Meta::from_bytes(&buf)?;
+      fields.id_block_size = meta.id_block_size;
+      let xq = Self {
+        storage: Mutex::new(storage),
+        root: meta.root,
+        active_files: HashMap::new(),
+        quad_cache: LruCache::new(fields.quad_cache_size),
+        quad_updates: Arc::new(RwLock::new(HashMap::new())),
+        id_cache: LruCache::new(fields.id_cache_size),
+        id_updates: Arc::new(RwLock::new(HashMap::new())),
+        missing_updates: HashMap::new(),
+        missing_count: 0,
+        next_quad_id: meta.next_quad_id,
+        next_missing_id: 0,
+        fields,
+      };
+      Ok(xq)
+    }
   }
   pub fn get_quad_ids(&self) -> Vec<QuadId> {
     let mut cursors = vec![&self.root];
@@ -492,6 +518,23 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         st.remove(&missing_file(i)).await?;
       }
     }
+    self.save_meta().await?;
+    Ok(())
+  }
+  fn get_meta(&self) -> Meta {
+    Meta {
+      next_quad_id: self.next_quad_id,
+      id_block_size: self.fields.id_block_size,
+      quad_block_size: self.fields.quad_block_size,
+      root: self.root.clone(),
+    }
+  }
+  async fn save_meta(&mut self) -> Result<(),Error> {
+    let mfile = "meta".to_string();
+    let mut s = self.open_file(&mfile).await?;
+    let buf = self.get_meta().to_bytes()?;
+    s.write_all(&buf).await?;
+    self.close_file(&mfile);
     Ok(())
   }
   fn id_block(&self, id: RecordId) -> IdBlock {
