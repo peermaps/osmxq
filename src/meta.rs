@@ -32,7 +32,7 @@ impl ToBytes for Meta {
         },
         QTree::Quad { bbox, id } => {
           offset += bbox.write_bytes(&mut buf[offset..])?;
-          offset += varint::encode(id*2+0, &mut buf[offset..])?;
+          offset += varint::encode(id*2+1, &mut buf[offset..])?;
         },
       }
       Ok(offset)
@@ -59,7 +59,7 @@ impl CountBytes for Meta {
         },
       }
     }
-    count(&self.root)
+    size + count(&self.root)
   }
   fn count_from_bytes(buf: &[u8]) -> Result<usize,Error> {
     unimplemented![]
