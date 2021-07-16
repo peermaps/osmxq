@@ -61,7 +61,7 @@ impl CountBytes for Meta {
     }
     size + count(&self.root)
   }
-  fn count_from_bytes(buf: &[u8]) -> Result<usize,Error> {
+  fn count_from_bytes(_buf: &[u8]) -> Result<usize,Error> {
     unimplemented![]
   }
 }

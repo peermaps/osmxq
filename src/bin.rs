@@ -17,10 +17,18 @@ async fn main() -> Result<(),Error> {
     .and_then(|xs| xs.first()).unwrap();
   let pbf = std::fs::File::open(pbf_file)?;
 
-  let (sender,receiver) = channel::bounded::<Vec<Feature>>(1_000);
+  let (sender,receiver) = channel::bounded::<Feature>(1_000_000);
   let mut work = vec![];
   work.push(task::spawn(async move {
-    while let Ok(records) = receiver.recv().await {
+    let mut records = vec![];
+    while let Ok(r) = receiver.recv().await {
+      records.push(r);
+      if records.len() >= 100_000 {
+        wrap_err(xq.add_records(&records).await.map_err(|e| e.into()));
+        records.clear();
+      }
+    }
+    if !records.is_empty() {
       wrap_err(xq.add_records(&records).await.map_err(|e| e.into()));
     }
     wrap_err(xq.finish().await.map_err(|e| e.into()));
@@ -28,17 +36,11 @@ async fn main() -> Result<(),Error> {
   }));
   work.push(task::spawn(async move {
     let sc = sender.clone();
-    let mut records = vec![];
     wrap_err(osmpbf::ElementReader::new(pbf).for_each(move |element| {
       let s = sc.clone();
-      records.push(Feature::new(element));
-      if records.len() >= 100_000 {
-        let rs = records.clone();
-        task::block_on(async move {
-          wrap_err(s.send(rs).await.map_err(|e| e.into()));
-        });
-        records.clear();
-      }
+      task::block_on(async move {
+        wrap_err(s.send(Feature::new(element)).await.map_err(|e| e.into()));
+      });
     }).map_err(|e| e.into()));
     sender.close();
   }));
@@ -84,8 +86,8 @@ impl Record for Feature {
   fn get_id(&self) -> RecordId {
     self.id
   }
-  fn get_refs<'a>(&'a self) -> &'a [RecordId] {
-    &self.refs
+  fn get_refs(&self) -> Vec<RecordId> {
+    self.refs.clone()
   }
   fn get_position(&self) -> Option<Position> {
     self.position

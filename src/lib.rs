@@ -5,7 +5,7 @@ use async_std::{prelude::*,fs,sync::{RwLock,Arc,Mutex}};
 use desert::{varint,ToBytes,FromBytes};
 
 mod storage;
-use storage::{Storage,FileStorage,RW};
+pub use storage::{Storage,FileStorage,RW};
 mod meta;
 use meta::Meta;
 
@@ -18,7 +18,7 @@ pub type Error = Box<dyn std::error::Error+Send+Sync>;
 
 pub trait Record: Send+Sync+Clone+std::fmt::Debug {
   fn get_id(&self) -> RecordId;
-  fn get_refs<'a>(&'a self) -> &'a [RecordId];
+  fn get_refs(&self) -> Vec<RecordId>;
   fn get_position(&self) -> Option<Position>;
   fn pack(records: &HashMap<RecordId,Self>) -> Vec<u8> where Self: Sized;
   fn unpack(buf: &[u8]) -> Result<HashMap<RecordId,Self>,Error>;
@@ -168,7 +168,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     self.close_file(&qfile);
     Ok(records)
   }
-  pub async fn read_denorm_quad(&mut self, q_id: QuadId) -> Result<Vec<(RecordId,R,Vec<R>)>,Error> {
+  pub async fn read_quad_denorm(&mut self, q_id: QuadId) -> Result<Vec<(RecordId,R,Vec<R>)>,Error> {
     let records = self.read_quad(q_id).await?;
     let rlen = records.len();
     let mut result = Vec::with_capacity(rlen);
@@ -176,10 +176,26 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       let refs = record.get_refs();
       let mut denorm = Vec::with_capacity(refs.len());
       for r_id in refs {
-        if let Some(r) = records.get(r_id) {
+        if let Some(r) = records.get(&r_id) {
+          let rrefs = r.get_refs();
           denorm.push(r.clone());
-        } else if let Some(r) = self.get_record(*r_id).await? {
-          denorm.push(r);
+          for rr_id in rrefs {
+            if let Some(rr) = records.get(&rr_id) {
+              denorm.push(rr.clone());
+            } else if let Some(rr) = self.get_record(rr_id).await? {
+              denorm.push(rr);
+            }
+          }
+        } else if let Some(r) = self.get_record(r_id).await? {
+          let rrefs = r.get_refs();
+          denorm.push(r.clone());
+          for rr_id in rrefs {
+            if let Some(rr) = records.get(&rr_id) {
+              denorm.push(rr.clone());
+            } else if let Some(rr) = self.get_record(rr_id).await? {
+              denorm.push(rr);
+            }
+          }
         }
         // else the ref is missing
       }
@@ -271,7 +287,6 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     Ok(())
   }
   pub async fn id_flush(&mut self) -> Result<(),Error> {
-    eprintln!["id_updates.len()={}", self.id_updates.read().await.len()];
     let iu = self.id_updates.clone();
     for (b,ids) in iu.write().await.drain() {
       let ifile = id_file_from_block(b);
@@ -482,16 +497,13 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     self.active_files.remove(file);
   }
   pub async fn finish(&mut self) -> Result<(),Error> {
-    println!["finish"];
     let mut prev_count = 0;
     let mut missing_start = 0;
     loop {
-      println!["missing_count={}", self.missing_count];
       let missing_end = self.next_missing_id;
       let m_records = self.missing_updates.drain().map(|(_,r)| r).collect::<Vec<_>>();
       for i in missing_start..missing_end {
         let mfile = missing_file(i);
-        println!["i={} mfile={}", i, &mfile];
         let mut buf = vec![];
         {
           let mut s = self.open_file(&mfile).await?;
@@ -501,10 +513,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         let mut records = R::unpack(&buf)?;
         self.add_records(&records.drain().map(|(_,r)| r).collect::<Vec<R>>()).await?;
       }
-      println!["add_records {}", m_records.len()];
       self.add_records(&m_records).await?;
       if self.missing_count == 0 || self.missing_count == prev_count {
-        println!["skipped {}", self.missing_count];
         break;
       }
       prev_count = self.missing_count;
