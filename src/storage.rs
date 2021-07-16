@@ -31,6 +31,7 @@ impl Storage<fs::File> for FileStorage {
     Ok(fs::OpenOptions::new().read(true).write(true).create(true).open(p).await?)
   }
   async fn remove(&mut self, name: &str) -> Result<(),Error> {
-    fs::remove_file(name).await.map_err(|e| e.into())
+    let p = self.path.join(name);
+    fs::remove_file(p).await.map_err(|e| e.into())
   }
 }
