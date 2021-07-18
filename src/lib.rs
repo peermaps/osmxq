@@ -407,19 +407,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     }
     for (r_id,r) in records.iter() {
       // check in records itself which was just removed from q_id
-      let mut o_p = r.get_position();
-      if o_p.is_none() {
-        o_p = r.get_refs().first()
-          .and_then(|f| records.get(f))
-          .and_then(|rr| rr.get_position());
-      }
-      if o_p.is_none() {
-        o_p = r.get_refs().first()
-          .and_then(|f| records.get(f))
-          .and_then(|rr| rr.get_refs().first().cloned())
-          .and_then(|f| records.get(&f))
-          .and_then(|rr| rr.get_position());
-      }
+      let mut o_p = check_position_records(r, &records);
       // then check the usual way
       if o_p.is_none() {
         o_p = self.get_position(&r).await?;
@@ -467,7 +455,11 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let mut result: HashMap<QuadId,(BBox,Vec<usize>)> = HashMap::new();
     let mut positions = HashMap::new();
     for (i,r) in records.iter().enumerate() {
-      if let Some(p) = self.get_position(r).await? {
+      let mut o_p = r.get_position();
+      if o_p.is_none() {
+        o_p = self.get_position(r).await?;
+      }
+      if let Some(p) = o_p {
         positions.insert(i,p);
       } else {
         self.missing_updates.insert(r.get_id(),r.clone());
@@ -630,4 +622,22 @@ fn pack_ids(records: &HashMap<RecordId,QuadId>) -> Vec<u8> {
     offset += varint::encode(*q_id, &mut buf[offset..]).unwrap();
   }
   buf
+}
+
+fn check_position_records<R: Record>(r: &R, records: &HashMap<RecordId,R>) -> Option<Position> {
+  // check in records itself which was just removed from q_id
+  let mut o_p = r.get_position();
+  if o_p.is_none() {
+    o_p = r.get_refs().first()
+      .and_then(|f| records.get(f))
+      .and_then(|rr| rr.get_position());
+  }
+  if o_p.is_none() {
+    o_p = r.get_refs().first()
+      .and_then(|f| records.get(f))
+      .and_then(|rr| rr.get_refs().first().cloned())
+      .and_then(|f| records.get(&f))
+      .and_then(|rr| rr.get_position());
+  }
+  o_p
 }
