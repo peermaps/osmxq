@@ -234,23 +234,31 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   pub async fn add_records(&mut self, records: &[R]) -> Result<(),Error> {
     if records.is_empty() { return Ok(()) }
     let qs = self.get_quads(&records).await?;
+    if qs.is_empty() { return Ok(()) }
     for (q_id,(bbox,ix)) in qs.iter() {
       for i in ix {
         let record = records.get(*i).unwrap();
         self.insert_id(record.get_id(), *q_id).await?;
       }
-      let mut item_len = 0;
-      self.quad_updates.write().await.get_mut(&q_id).map(|o_items| {
-        if o_items.is_none() {
-          *o_items = Some(HashMap::new());
+      let item_len = {
+        let mut qu = self.quad_updates.write().await;
+        if let Some(Some(items)) = qu.get_mut(&q_id) {
+          for i in ix {
+            let r = records.get(*i).unwrap();
+            items.insert(r.get_id(), r.clone());
+          }
+          items.len()
+        } else {
+          let mut items = HashMap::new();
+          for i in ix {
+            let r = records.get(*i).unwrap();
+            items.insert(r.get_id(), r.clone());
+          }
+          let item_len = items.len();
+          qu.insert(*q_id, Some(items));
+          item_len
         }
-        let items = o_items.as_mut().unwrap();
-        for i in ix {
-          let r = records.get(*i).unwrap();
-          items.insert(r.get_id(), r.clone());
-        }
-        item_len = items.len();
-      });
+      };
       if item_len > self.fields.quad_block_size {
         self.split_quad(&q_id, &bbox).await?;
       }
@@ -436,8 +444,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     self.check_flush().await?;
     Ok(())
   }
-  pub async fn get_quads(&mut self, records: &[R])
-  -> Result<HashMap<QuadId,(BBox,Vec<usize>)>,Error> {
+  pub async fn get_quads(&mut self, records: &[R]) -> Result<HashMap<QuadId,(BBox,Vec<usize>)>,Error> {
     let mut result: HashMap<QuadId,(BBox,Vec<usize>)> = HashMap::new();
     let mut positions = HashMap::new();
     for (i,r) in records.iter().enumerate() {
