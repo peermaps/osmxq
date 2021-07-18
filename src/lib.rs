@@ -405,14 +405,33 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         quads.push((b,HashMap::new()));
       }
     }
-    for (r_id,r) in records {
-      if let Some(p) = self.get_position(&r).await? {
+    for (r_id,r) in records.iter() {
+      // check in records itself which was just removed from q_id
+      let mut o_p = r.get_position();
+      if o_p.is_none() {
+        o_p = r.get_refs().first()
+          .and_then(|f| records.get(f))
+          .and_then(|rr| rr.get_position());
+      }
+      if o_p.is_none() {
+        o_p = r.get_refs().first()
+          .and_then(|f| records.get(f))
+          .and_then(|rr| rr.get_refs().first().cloned())
+          .and_then(|f| records.get(&f))
+          .and_then(|rr| rr.get_position());
+      }
+      // then check the usual way
+      if o_p.is_none() {
+        o_p = self.get_position(&r).await?;
+      }
+      if let Some(p) = o_p {
         let i = quads.iter().position(|(b,_)| overlap(&p, &b)).unwrap();
         let q = quads.get_mut(i).unwrap();
-        q.1.insert(r_id,r);
+        q.1.insert(*r_id,r.clone());
       } else {
-        self.missing_updates.insert(r.get_id(),r);
-        self.missing_count += 1;
+        panic!["missing record in split quad"];
+        //self.missing_updates.insert(r.get_id(),r);
+        //self.missing_count += 1;
       }
     }
     let mut i = 0;
