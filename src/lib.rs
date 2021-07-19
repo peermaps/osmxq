@@ -454,8 +454,12 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   pub async fn get_quads(&mut self, records: &[R]) -> Result<HashMap<QuadId,(BBox,Vec<usize>)>,Error> {
     let mut result: HashMap<QuadId,(BBox,Vec<usize>)> = HashMap::new();
     let mut positions = HashMap::new();
+    let mut rmap = HashMap::new();
+    for r in records.iter() {
+      rmap.insert(r.get_id(), r.clone());
+    }
     for (i,r) in records.iter().enumerate() {
-      let mut o_p = r.get_position();
+      let mut o_p = check_position_records(r, &rmap);
       if o_p.is_none() {
         o_p = self.get_position(r).await?;
       }
@@ -498,6 +502,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       ncursors = cursors;
       cursors = tmp;
     }
+    //assert![positions.is_empty(), "!positions.is_empty()"];
     Ok(result)
   }
   async fn open_file(&mut self, file: &String) -> Result<S,Error> {
