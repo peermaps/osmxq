@@ -287,7 +287,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       let rs = o_rs.unwrap();
       let qfile = quad_file(q_id);
       let mut s = self.open_file(&qfile).await?;
-      s.write_all(&R::pack(&rs)).await?;
+      let buf = &R::pack(&rs);
+      s.write_all(&buf).await?;
+      s.set_len(buf.len() as u64).await?;
       s.flush().await?;
       self.quad_cache.put(q_id,rs);
       self.close_file(&qfile);
@@ -299,7 +301,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     for (b,ids) in iu.write().await.drain() {
       let ifile = id_file_from_block(b);
       let mut s = self.open_file(&ifile).await?;
-      s.write_all(&pack_ids(&ids)).await?;
+      let buf = pack_ids(&ids);
+      s.write_all(&buf).await?;
+      s.set_len(buf.len() as u64).await?;
       s.flush().await?;
       self.id_cache.put(b,ids);
       self.close_file(&ifile);
@@ -312,7 +316,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     self.next_missing_id += 1;
     let mfile = missing_file(m_id);
     let mut s = self.open_file(&mfile).await?;
-    s.write_all(&R::pack(&self.missing_updates)).await?;
+    let buf = R::pack(&self.missing_updates);
+    s.write_all(&buf).await?;
+    s.set_len(buf.len() as u64).await?;
     s.flush().await?;
     self.missing_updates.clear();
     self.close_file(&mfile);
@@ -599,6 +605,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let mut s = self.open_file(&mfile).await?;
     let buf = self.get_meta().to_bytes()?;
     s.write_all(&buf).await?;
+    s.set_len(buf.len() as u64).await?;
     self.close_file(&mfile);
     Ok(())
   }

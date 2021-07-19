@@ -1,8 +1,13 @@
 use async_std::{io::{Read,Write},fs};
 use std::path::PathBuf;
 
-pub trait RW: Read+Write+Send+Sync+Unpin {}
+pub trait RW: Read+Write+Truncate+Send+Sync+Unpin {}
 impl RW for fs::File {}
+
+#[async_trait::async_trait]
+pub trait Truncate {
+  async fn set_len(&mut self, len: u64) -> Result<(),Error>;
+}
 
 type Error = Box<dyn std::error::Error+Send+Sync>;
 
@@ -33,5 +38,12 @@ impl Storage<fs::File> for FileStorage {
   async fn remove(&mut self, name: &str) -> Result<(),Error> {
     let p = self.path.join(name);
     fs::remove_file(p).await.map_err(|e| e.into())
+  }
+}
+
+#[async_trait::async_trait]
+impl Truncate for fs::File {
+  async fn set_len(&mut self, len: u64) -> Result<(),Error> {
+    fs::File::set_len(self, len).await.map_err(|e| e.into())
   }
 }
