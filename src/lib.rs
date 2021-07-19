@@ -423,6 +423,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       }
     }
     let mut i = 0;
+    let mut nchildren = vec![];
     for q in quads {
       if i == 0 {
         for (r_id,_) in q.1.iter() {
@@ -433,6 +434,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         } else {
           self.quad_updates.write().await.insert(*q_id, Some(q.1));
         }
+        nchildren.push(QTree::Quad { id: *q_id, bbox: q.0.clone() });
       } else {
         let id = self.next_quad_id;
         self.next_quad_id += 1;
@@ -444,9 +446,39 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         } else {
           self.quad_updates.write().await.insert(id, Some(q.1));
         }
+        nchildren.push(QTree::Quad { id, bbox: q.0.clone() });
       }
       i += 1;
     }
+
+    {
+      let mut cursors = vec![&mut self.root];
+      let mut ncursors = vec![];
+      let mut found = false;
+      while !found {
+        let mut count = 0;
+        for c in cursors.drain(..) {
+          count += 1;
+          match c {
+            QTree::Node { children, .. } => {
+              ncursors.extend(children.iter_mut()
+                .filter(|ch| { bbox_overlap(bbox,&ch.bbox()) })
+                .collect::<Vec<_>>());
+            },
+            QTree::Quad { id, .. } => {
+              if id == q_id {
+                found = true;
+                *c = QTree::Node { children: nchildren.clone(), bbox: bbox.clone() };
+                break;
+              }
+            },
+          }
+        }
+        if count == 0 || found { break }
+        cursors = ncursors.drain(..).collect();
+      }
+    }
+
     self.close_file(&qfile);
     self.check_flush().await?;
     Ok(())
@@ -587,6 +619,9 @@ impl<R> XQ<fs::File,R> where R: Record {
 
 fn overlap(p: &Position, bbox: &BBox) -> bool {
   p.0 >= bbox.0 && p.0 <= bbox.2 && p.1 >= bbox.1 && p.1 <= bbox.3
+}
+fn bbox_overlap(a: &BBox, b: &BBox) -> bool {
+  a.1 >= b.0 && a.0 <= b.1
 }
 fn quad_file(q_id: QuadId) -> String {
   format!["q/{:02x}/{:x}",q_id%256,q_id/256]
