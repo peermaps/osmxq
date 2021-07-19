@@ -429,7 +429,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       }
     }
     let mut i = 0;
-    let mut nchildren = vec![];
+    let mut nchildren = Vec::with_capacity(quads.len());
     for q in quads {
       if i == 0 {
         for (r_id,_) in q.1.iter() {
@@ -483,6 +483,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         if count == 0 || found { break }
         cursors = ncursors.drain(..).collect();
       }
+      assert![found, "did not locate quad id={} bbox={:?}\n  root={:?}", q_id, bbox, &self.root];
     }
 
     self.close_file(&qfile);
@@ -628,7 +629,7 @@ fn overlap(p: &Position, bbox: &BBox) -> bool {
   p.0 >= bbox.0 && p.0 <= bbox.2 && p.1 >= bbox.1 && p.1 <= bbox.3
 }
 fn bbox_overlap(a: &BBox, b: &BBox) -> bool {
-  a.1 >= b.0 && a.0 <= b.1
+  a.2 >= b.0 && a.0 <= b.2 && a.3 >= b.1 && a.1 <= b.3
 }
 fn quad_file(q_id: QuadId) -> String {
   format!["q/{:02x}/{:x}",q_id%256,q_id/256]
