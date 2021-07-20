@@ -241,23 +241,28 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         self.insert_id(record.get_id(), *q_id).await?;
       }
       let item_len = {
-        let mut qu = self.quad_updates.write().await;
-        if let Some(Some(items)) = qu.get_mut(&q_id) {
+        let mut item_len = None;
+        {
+          let mut qu = self.quad_updates.write().await;
+          if let Some(Some(items)) = qu.get_mut(&q_id) {
+            for i in ix {
+              let r = records.get(*i).unwrap();
+              items.insert(r.get_id(), r.clone());
+            }
+            item_len = Some(items.len());
+          }
+        };
+        if item_len.is_none() {
+          let mut items = self.read_quad(*q_id).await?;
           for i in ix {
             let r = records.get(*i).unwrap();
             items.insert(r.get_id(), r.clone());
           }
-          items.len()
-        } else {
-          let mut items = HashMap::new();
-          for i in ix {
-            let r = records.get(*i).unwrap();
-            items.insert(r.get_id(), r.clone());
-          }
-          let item_len = items.len();
+          item_len = Some(items.len());
+          let mut qu = self.quad_updates.write().await;
           qu.insert(*q_id, Some(items));
-          item_len
         }
+        item_len.unwrap()
       };
       if item_len > self.fields.quad_block_size {
         self.split_quad(&q_id, &bbox).await?;
@@ -288,8 +293,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       let qfile = quad_file(q_id);
       let mut s = self.open_file(&qfile).await?;
       let buf = &R::pack(&rs);
-      s.write_all(&buf).await?;
       s.set_len(buf.len() as u64).await?;
+      s.write_all(&buf).await?;
       s.flush().await?;
       self.quad_cache.put(q_id,rs);
       self.close_file(&qfile);
@@ -302,8 +307,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       let ifile = id_file_from_block(b);
       let mut s = self.open_file(&ifile).await?;
       let buf = pack_ids(&ids);
-      s.write_all(&buf).await?;
       s.set_len(buf.len() as u64).await?;
+      s.write_all(&buf).await?;
       s.flush().await?;
       self.id_cache.put(b,ids);
       self.close_file(&ifile);
@@ -317,8 +322,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let mfile = missing_file(m_id);
     let mut s = self.open_file(&mfile).await?;
     let buf = R::pack(&self.missing_updates);
-    s.write_all(&buf).await?;
     s.set_len(buf.len() as u64).await?;
+    s.write_all(&buf).await?;
     s.flush().await?;
     self.missing_updates.clear();
     self.close_file(&mfile);
@@ -483,7 +488,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         if count == 0 || found { break }
         cursors = ncursors.drain(..).collect();
       }
-      assert![found, "did not locate quad id={} bbox={:?}\n  root={:?}", q_id, bbox, &self.root];
+      assert![found, "did not locate quad id={}", q_id];
     }
 
     self.close_file(&qfile);
@@ -601,12 +606,12 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       root: self.root.clone(),
     }
   }
-  async fn save_meta(&mut self) -> Result<(),Error> {
+  pub async fn save_meta(&mut self) -> Result<(),Error> {
     let mfile = "meta".to_string();
     let mut s = self.open_file(&mfile).await?;
     let buf = self.get_meta().to_bytes()?;
-    s.write_all(&buf).await?;
     s.set_len(buf.len() as u64).await?;
+    s.write_all(&buf).await?;
     self.close_file(&mfile);
     Ok(())
   }
