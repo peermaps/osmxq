@@ -1,5 +1,4 @@
-use async_std::{io::{Read,Write},fs};
-use std::path::PathBuf;
+use async_std::{io::{Read,Write},fs,path::PathBuf};
 
 pub trait RW: Read+Write+Truncate+Send+Sync+Unpin {}
 impl RW for fs::File {}
@@ -13,7 +12,8 @@ type Error = Box<dyn std::error::Error+Send+Sync>;
 
 #[async_trait::async_trait]
 pub trait Storage<S>: Send+Sync+Unpin where S: RW {
-  async fn open(&mut self, name: &str) -> Result<S,Error>;
+  async fn open_rw(&mut self, name: &str) -> Result<S,Error>;
+  async fn open_r(&mut self, name: &str) -> Result<Option<S>,Error>;
   async fn remove(&mut self, name: &str) -> Result<(),Error>;
 }
 
@@ -30,10 +30,18 @@ impl FileStorage {
 
 #[async_trait::async_trait]
 impl Storage<fs::File> for FileStorage {
-  async fn open(&mut self, name: &str) -> Result<fs::File,Error> {
+  async fn open_rw(&mut self, name: &str) -> Result<fs::File,Error> {
     let p = self.path.join(name);
     fs::create_dir_all(p.parent().unwrap()).await?;
     Ok(fs::OpenOptions::new().read(true).write(true).create(true).open(p).await?)
+  }
+  async fn open_r(&mut self, name: &str) -> Result<Option<fs::File>,Error> {
+    let p = self.path.join(name);
+    if p.exists().await {
+      Ok(Some(fs::OpenOptions::new().read(true).open(p).await?))
+    } else {
+      Ok(None)
+    }
   }
   async fn remove(&mut self, name: &str) -> Result<(),Error> {
     let p = self.path.join(name);
