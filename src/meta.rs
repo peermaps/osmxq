@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use desert::{varint,ToBytes,CountBytes,FromBytes};
 use crate::{QuadId,QTree,BBox,Error};
 
@@ -6,6 +7,7 @@ pub struct Meta {
   pub id_block_size: u64,
   pub quad_block_size: u64,
   pub root: QTree,
+  pub quad_count: HashMap<QuadId,u64>,
 }
 
 impl ToBytes for Meta {
@@ -19,6 +21,12 @@ impl ToBytes for Meta {
     offset += varint::encode(self.next_quad_id, &mut buf[offset..])?;
     offset += varint::encode(self.id_block_size as u64, &mut buf[offset..])?;
     offset += varint::encode(self.quad_block_size as u64, &mut buf[offset..])?;
+
+    offset += varint::encode(self.quad_count.len() as u64, &mut buf[offset..])?;
+    for (q_id,c) in self.quad_count.iter() {
+      offset += varint::encode(*q_id, &mut buf[offset..])?;
+      offset += varint::encode(*c as u64, &mut buf[offset..])?;
+    }
 
     fn write(node: &QTree, buf: &mut [u8]) -> Result<usize,Error> {
       let mut offset = 0;
@@ -47,7 +55,13 @@ impl CountBytes for Meta {
     size += varint::length(self.next_quad_id);
     size += varint::length(self.id_block_size as u64);
     size += varint::length(self.quad_block_size as u64);
-    
+
+    size += varint::length(self.quad_count.len() as u64);
+    for (q_id,c) in self.quad_count.iter() {
+      size += varint::length(*q_id);
+      size += varint::length(*c as u64);
+    }
+
     fn count(node: &QTree) -> usize {
       match node {
         QTree::Node { bbox, children } => {
@@ -76,6 +90,17 @@ impl FromBytes for Meta {
     let (s,quad_block_size) = varint::decode(&buf[offset..])?;
     offset += s;
 
+    let (s,qclen) = varint::decode(&buf[offset..])?;
+    offset += s;
+    let mut quad_count = HashMap::with_capacity(qclen as usize);
+    for _ in 0..qclen {
+      let (s,q_id) = varint::decode(&buf[offset..])?;
+      offset += s;
+      let (s,c) = varint::decode(&buf[offset..])?;
+      offset += s;
+      quad_count.insert(q_id, c);
+    }
+
     fn parse(buf: &[u8]) -> Result<(usize,QTree),Error> {
       let mut offset = 0;
       let (s,bbox) = BBox::from_bytes(&buf[offset..])?;
@@ -101,6 +126,7 @@ impl FromBytes for Meta {
       next_quad_id,
       id_block_size: id_block_size,
       quad_block_size: quad_block_size,
+      quad_count,
       root
     }))
   }
