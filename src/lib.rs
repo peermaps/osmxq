@@ -55,6 +55,7 @@ pub struct XQ<S,R> where S: RW, R: Record {
   fields: Fields,
 }
 
+#[derive(Debug,Clone)]
 pub struct Fields {
   pub id_block_size: u64,
   pub id_cache_size: usize,
@@ -70,10 +71,10 @@ impl Default for Fields {
     Self {
       id_block_size: 500_000,
       id_cache_size: 5_000,
-      id_flush_size: 25_000_000,
+      id_flush_size: 10_000_000,
       quad_block_size: 50_000,
-      quad_cache_size: 5_000,
-      quad_flush_size: 5_000,
+      quad_cache_size: 2_000,
+      quad_flush_size: 1_000,
       missing_flush_size: 2_000_000,
     }
   }
