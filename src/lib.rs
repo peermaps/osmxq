@@ -69,11 +69,11 @@ impl Default for Fields {
   fn default() -> Self {
     Self {
       id_block_size: 500_000,
-      id_cache_size: 2_000,
-      id_flush_size: 500,
+      id_cache_size: 5_000,
+      id_flush_size: 5_000,
       quad_block_size: 50_000,
-      quad_cache_size: 1_000,
-      quad_flush_size: 500,
+      quad_cache_size: 5_000,
+      quad_flush_size: 5_000,
       missing_flush_size: 2_000_000,
     }
   }
@@ -418,7 +418,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         },
       }
     };
-    let (nx,ny) = (4,4);
+    let (nx,ny) = (2,2);
     let mut quads = vec![];
     for i in 0..nx {
       for j in 0..ny {
@@ -713,7 +713,6 @@ fn pack_ids(records: &HashMap<RecordId,QuadId>) -> Vec<u8> {
 }
 
 fn check_position_records<R: Record>(r: &R, records: &HashMap<RecordId,R>) -> Option<Position> {
-  // check in records itself which was just removed from q_id
   let mut o_p = r.get_position();
   if o_p.is_none() {
     o_p = r.get_refs().first()
