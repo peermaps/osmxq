@@ -56,13 +56,13 @@ pub struct XQ<S,R> where S: RW, R: Record {
 }
 
 pub struct Fields {
-  id_block_size: usize,
-  id_cache_size: usize,
-  id_flush_size: usize,
-  quad_block_size: usize,
-  quad_cache_size: usize,
-  quad_flush_size: usize,
-  missing_flush_size: usize,
+  pub id_block_size: usize,
+  pub id_cache_size: usize,
+  pub id_flush_size: usize,
+  pub quad_block_size: usize,
+  pub quad_cache_size: usize,
+  pub quad_flush_size: usize,
+  pub missing_flush_size: usize,
 }
 
 impl Default for Fields {
