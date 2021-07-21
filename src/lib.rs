@@ -439,9 +439,10 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         o_p = self.get_position(&r).await?;
       }
       if let Some(p) = o_p {
-        let i = quads.iter().position(|(b,_)| overlap(&p, &b)).unwrap();
-        let q = quads.get_mut(i).unwrap();
-        q.1.insert(*r_id,r.clone());
+        if let Some(i) = quads.iter().position(|(b,_)| overlap(&p, &b)) {
+          let q = quads.get_mut(i).unwrap();
+          q.1.insert(*r_id,r.clone());
+        }
       } else {
         panic!["missing record in split quad"];
         //self.missing_updates.insert(r.get_id(),r);
