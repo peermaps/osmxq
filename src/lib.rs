@@ -76,7 +76,7 @@ impl Default for Fields {
       id_flush_size: 10_000_000,
       quad_block_size: 50_000,
       quad_cache_size: 2_000,
-      quad_flush_size: 1_000_000,
+      quad_flush_size: 10_000_000,
       missing_flush_size: 2_000_000,
     }
   }
