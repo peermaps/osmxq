@@ -3,8 +3,8 @@ use crate::{QuadId,QTree,BBox,Error};
 
 pub struct Meta {
   pub next_quad_id: QuadId,
-  pub id_block_size: usize,
-  pub quad_block_size: usize,
+  pub id_block_size: u64,
+  pub quad_block_size: u64,
   pub root: QTree,
 }
 
@@ -99,8 +99,8 @@ impl FromBytes for Meta {
     offset += s;
     Ok((offset, Self {
       next_quad_id,
-      id_block_size: id_block_size as usize,
-      quad_block_size: quad_block_size as usize,
+      id_block_size: id_block_size,
+      quad_block_size: quad_block_size,
       root
     }))
   }

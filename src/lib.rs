@@ -48,6 +48,7 @@ pub struct XQ<S,R> where S: RW, R: Record {
   next_quad_id: QuadId,
   id_cache: LruCache<IdBlock,HashMap<RecordId,QuadId>>,
   id_updates: Arc<RwLock<HashMap<IdBlock,HashMap<RecordId,QuadId>>>>,
+  id_update_count: u64,
   missing_updates: HashMap<RecordId,R>,
   missing_count: usize,
   next_missing_id: u64,
@@ -55,13 +56,13 @@ pub struct XQ<S,R> where S: RW, R: Record {
 }
 
 pub struct Fields {
-  pub id_block_size: usize,
+  pub id_block_size: u64,
   pub id_cache_size: usize,
-  pub id_flush_size: usize,
-  pub quad_block_size: usize,
+  pub id_flush_size: u64,
+  pub quad_block_size: u64,
   pub quad_cache_size: usize,
-  pub quad_flush_size: usize,
-  pub missing_flush_size: usize,
+  pub quad_flush_size: u64,
+  pub missing_flush_size: u64,
 }
 
 impl Default for Fields {
@@ -69,7 +70,7 @@ impl Default for Fields {
     Self {
       id_block_size: 500_000,
       id_cache_size: 5_000,
-      id_flush_size: 5_000,
+      id_flush_size: 25_000_000,
       quad_block_size: 50_000,
       quad_cache_size: 5_000,
       quad_flush_size: 5_000,
@@ -103,6 +104,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         quad_updates: Arc::new(RwLock::new(quad_updates)),
         id_cache: LruCache::new(fields.id_cache_size),
         id_updates: Arc::new(RwLock::new(HashMap::new())),
+        id_update_count: 0,
         missing_updates: HashMap::new(),
         missing_count: 0,
         next_quad_id: 1,
@@ -121,6 +123,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         quad_updates: Arc::new(RwLock::new(HashMap::new())),
         id_cache: LruCache::new(fields.id_cache_size),
         id_updates: Arc::new(RwLock::new(HashMap::new())),
+        id_update_count: 0,
         missing_updates: HashMap::new(),
         missing_count: 0,
         next_quad_id: meta.next_quad_id,
@@ -211,12 +214,14 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let b = self.id_block(id);
     if let Some(ids) = self.id_updates.write().await.get_mut(&b) {
       ids.insert(id, q_id);
+      self.id_update_count += 1;
       return Ok(());
     }
     {
       let mut ids = HashMap::new();
       ids.insert(id, q_id);
       self.id_updates.write().await.insert(b, ids);
+      self.id_update_count += 1;
     }
     Ok(())
   }
@@ -238,7 +243,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
               let r = records.get(*i).unwrap();
               items.insert(r.get_id(), r.clone());
             }
-            item_len = Some(items.len());
+            item_len = Some(items.len() as u64);
           }
         };
         if item_len.is_none() {
@@ -247,7 +252,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
             let r = records.get(*i).unwrap();
             items.insert(r.get_id(), r.clone());
           }
-          item_len = Some(items.len());
+          item_len = Some(items.len() as u64);
           let mut qu = self.quad_updates.write().await;
           qu.insert(*q_id, Some(items));
         }
@@ -262,13 +267,13 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   }
   pub async fn check_flush(&mut self) -> Result<(),Error> {
     // todo: parallel io
-    if self.quad_updates.read().await.len() >= self.fields.quad_flush_size {
+    if self.quad_updates.read().await.len() as u64 >= self.fields.quad_flush_size {
       self.quad_flush().await?;
     }
-    if self.id_updates.read().await.len() >= self.fields.id_flush_size {
+    if self.id_update_count >= self.fields.id_flush_size {
       self.id_flush().await?;
     }
-    if self.missing_updates.len() >= self.fields.missing_flush_size {
+    if self.missing_updates.len() as u64 >= self.fields.missing_flush_size {
       self.missing_flush().await?;
     }
     Ok(())
@@ -318,6 +323,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       self.id_cache.put(b,ids);
       self.close_file(&ifile);
     }
+    self.id_update_count = 0;
     Ok(())
   }
   pub async fn missing_flush(&mut self) -> Result<(),Error> {
