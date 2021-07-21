@@ -1,6 +1,6 @@
 [package]
 name = "osmxq"
-version = "1.0.0"
+version = "1.0.1"
 description = "indexed quad format for open street map data"
 edition = "2018"
 license = "BSD-3-Clause"
