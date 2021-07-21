@@ -1,7 +1,7 @@
 #![feature(hash_drain_filter,async_closure)]
 use std::collections::HashMap;
 use lru::LruCache;
-use async_std::{prelude::*,fs,sync::{RwLock,Arc,Mutex}};
+use async_std::{prelude::*,fs,sync::{RwLock,Arc,Mutex},io};
 use desert::{varint,ToBytes,FromBytes};
 
 mod storage;
@@ -46,7 +46,6 @@ pub struct XQ<S,R> where S: RW, R: Record {
   quad_cache: LruCache<QuadId,HashMap<RecordId,R>>,
   quad_updates: Arc<RwLock<HashMap<QuadId,Option<HashMap<RecordId,R>>>>>,
   next_quad_id: QuadId,
-  // todo: quad_id_cache
   id_cache: LruCache<IdBlock,HashMap<RecordId,QuadId>>,
   id_updates: Arc<RwLock<HashMap<IdBlock,HashMap<RecordId,QuadId>>>>,
   missing_updates: HashMap<RecordId,R>,
@@ -210,31 +209,14 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   }
   async fn insert_id(&mut self, id: RecordId, q_id: QuadId) -> Result<(),Error> {
     let b = self.id_block(id);
-    let ifile = self.id_file(id);
     if let Some(ids) = self.id_updates.write().await.get_mut(&b) {
       ids.insert(id, q_id);
       return Ok(());
     }
-    if let Some(mut ids) = self.id_cache.pop(&b) {
-      ids.insert(id, q_id);
-      self.id_updates.write().await.insert(b, ids);
-      return Ok(());
-    }
     {
-      let o_s = self.open_file_r(&ifile).await?;
-      if let Some(mut ids) = self.id_cache.pop(&b) {
-        ids.insert(id, q_id);
-        self.id_updates.write().await.insert(b, ids);
-        return Ok(());
-      }
-      let mut buf = vec![];
-      if let Some(mut s) = o_s {
-        s.read_to_end(&mut buf).await?;
-      }
-      let mut ids = unpack_ids(&buf)?;
+      let mut ids = HashMap::new();
       ids.insert(id, q_id);
       self.id_updates.write().await.insert(b, ids);
-      self.close_file(&ifile);
     }
     Ok(())
   }
@@ -313,7 +295,23 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     for (b,ids) in iu.write().await.drain() {
       let ifile = id_file_from_block(b);
       let mut s = self.open_file_rw(&ifile).await?;
-      let buf = pack_ids(&ids);
+      let buf = {
+        if let Some(xids) = self.id_cache.get_mut(&b) {
+          for (id,q_id) in ids.iter() {
+            xids.insert(*id, *q_id);
+          }
+          pack_ids(&xids)
+        } else {
+          let mut buf = vec![];
+          s.read_to_end(&mut buf).await?;
+          s.seek(io::SeekFrom::Start(0)).await?;
+          let mut xids = unpack_ids(&buf)?;
+          for (id,q_id) in ids.iter() {
+            xids.insert(*id,*q_id);
+          }
+          pack_ids(&xids)
+        }
+      };
       s.set_len(buf.len() as u64).await?;
       s.write_all(&buf).await?;
       s.flush().await?;

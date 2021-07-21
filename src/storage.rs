@@ -1,6 +1,6 @@
-use async_std::{io::{Read,Write},fs,path::PathBuf};
+use async_std::{io::{Read,Write,Seek},fs,path::PathBuf};
 
-pub trait RW: Read+Write+Truncate+Send+Sync+Unpin {}
+pub trait RW: Read+Write+Seek+Truncate+Send+Sync+Unpin {}
 impl RW for fs::File {}
 
 #[async_trait::async_trait]
