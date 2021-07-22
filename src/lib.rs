@@ -45,6 +45,7 @@ pub struct XQ<S,R> where S: RW, R: Record {
   root: QTree,
   quad_cache: LruCache<QuadId,HashMap<RecordId,R>>,
   quad_updates: Arc<RwLock<HashMap<QuadId,Option<HashMap<RecordId,R>>>>>,
+  quad_update_age: HashMap<QuadId,usize>,
   quad_update_count: u64,
   quad_count: HashMap<QuadId,u64>,
   next_quad_id: QuadId,
@@ -65,6 +66,8 @@ pub struct Fields {
   pub quad_block_size: u64,
   pub quad_cache_size: usize,
   pub quad_flush_size: u64,
+  pub quad_flush_top: usize,
+  pub quad_flush_max_age: usize,
   pub missing_flush_size: u64,
 }
 
@@ -76,7 +79,9 @@ impl Default for Fields {
       id_flush_size: 10_000_000,
       quad_block_size: 50_000,
       quad_cache_size: 2_000,
-      quad_flush_size: 10_000_000,
+      quad_flush_size: 20_000_000,
+      quad_flush_top: 200,
+      quad_flush_max_age: 20,
       missing_flush_size: 2_000_000,
     }
   }
@@ -108,6 +113,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         quad_cache: LruCache::new(fields.quad_cache_size),
         quad_updates: Arc::new(RwLock::new(quad_updates)),
         quad_update_count: 0,
+        quad_update_age: HashMap::new(),
         quad_count,
         id_cache: LruCache::new(fields.id_cache_size),
         id_updates: Arc::new(RwLock::new(HashMap::new())),
@@ -129,6 +135,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         quad_cache: LruCache::new(fields.quad_cache_size),
         quad_updates: Arc::new(RwLock::new(HashMap::new())),
         quad_update_count: 0,
+        quad_update_age: HashMap::new(),
         quad_count: meta.quad_count,
         id_cache: LruCache::new(fields.id_cache_size),
         id_updates: Arc::new(RwLock::new(HashMap::new())),
@@ -281,7 +288,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   pub async fn check_flush(&mut self) -> Result<(),Error> {
     // todo: parallel io
     if self.quad_update_count >= self.fields.quad_flush_size {
-      self.quad_flush().await?;
+      self.quad_flush_partial(self.fields.quad_flush_top).await?;
     }
     if self.id_update_count >= self.fields.id_flush_size {
       self.id_flush().await?;
@@ -291,38 +298,84 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     }
     Ok(())
   }
-  pub async fn quad_flush(&mut self) -> Result<(),Error> {
+  async fn quad_flush_by_id(&mut self, q_id: QuadId) -> Result<(),Error> {
+    let o_rs = {
+      let mut qu = self.quad_updates.write().await;
+      qu.remove(&q_id).and_then(|v| v)
+    };
+    if o_rs.is_none() { return Ok(()) }
+    let rs: HashMap<u64,R> = o_rs.unwrap();
+    if rs.is_empty() { return Ok(()) }
+    let qfile = quad_file(q_id);
+    let mut s = self.open_file_rw(&qfile).await?;
+    let buf = {
+      if let Some(records) = self.quad_cache.get_mut(&q_id) {
+        for (r_id,r) in rs.iter() {
+          records.insert(*r_id, r.clone());
+        }
+        R::pack(&records)
+      } else {
+        let mut buf = vec![];
+        s.read_to_end(&mut buf).await?;
+        s.seek(io::SeekFrom::Start(0)).await?;
+        let mut records = R::unpack(&buf)?;
+        for (r_id,r) in rs.iter() {
+          records.insert(*r_id, r.clone());
+        }
+        self.quad_cache.put(q_id, records.clone());
+        R::pack(&records)
+      }
+    };
+    s.set_len(buf.len() as u64).await?;
+    s.write_all(&buf).await?;
+    s.flush().await?;
+    self.close_file(&qfile);
+    self.quad_update_count -= rs.len() as u64;
+    self.quad_count.insert(q_id, 0);
+    self.quad_update_age.insert(q_id, 0);
+    Ok(())
+  }
+  pub async fn quad_flush_all(&mut self) -> Result<(),Error> {
     // todo: parallel io
-    let qu = self.quad_updates.clone();
-    for (q_id,o_rs) in qu.write().await.drain() {
-      if o_rs.is_none() { continue }
-      let rs = o_rs.unwrap();
-      let qfile = quad_file(q_id);
-      let mut s = self.open_file_rw(&qfile).await?;
-      let buf = {
-        if let Some(records) = self.quad_cache.get_mut(&q_id) {
-          for (r_id,r) in rs.iter() {
-            records.insert(*r_id, r.clone());
-          }
-          R::pack(&records)
+    let qs = self.quad_updates.read().await.keys().copied().collect::<Vec<QuadId>>();
+    for q_id in qs {
+      self.quad_flush_by_id(q_id).await?;
+    }
+    Ok(())
+  }
+  pub async fn quad_flush_partial(&mut self, n: usize) -> Result<(),Error> {
+    let mut qs = self.quad_updates.read().await.keys()
+      .filter(|q_id| { self.quad_count.get(q_id).copied().unwrap_or(0) > 0 })
+      .copied()
+      .collect::<Vec<QuadId>>();
+    qs.sort_unstable_by(|a,b| {
+      let ca = self.quad_count.get(a).copied().unwrap_or(0);
+      let cb = self.quad_count.get(b).copied().unwrap_or(0);
+      cb.cmp(&ca) // descending
+    });
+    for q_id in &qs[0..n.min(qs.len())] {
+      //println!["flush {} (top: {})", q_id, self.quad_count.get(q_id).copied().unwrap_or(0)];
+      self.quad_flush_by_id(*q_id).await?;
+    }
+    let mut queue = vec![];
+    for q_id in self.quad_updates.read().await.keys() {
+      let age = {
+        if let Some(age) = self.quad_update_age.get_mut(q_id) {
+          *age += 1;
+          age.clone()
         } else {
-          let mut buf = vec![];
-          s.read_to_end(&mut buf).await?;
-          s.seek(io::SeekFrom::Start(0)).await?;
-          let mut records = R::unpack(&buf)?;
-          for (r_id,r) in rs.iter() {
-            records.insert(*r_id, r.clone());
-          }
-          R::pack(&records)
+          self.quad_update_age.insert(*q_id, 1);
+          1
         }
       };
-      s.set_len(buf.len() as u64).await?;
-      s.write_all(&buf).await?;
-      s.flush().await?;
-      self.close_file(&qfile);
-      self.quad_count.insert(q_id, 0);
+      if age > self.fields.quad_flush_max_age {
+        //println!["flush {} (age)", q_id];
+        queue.push(*q_id);
+      }
     }
-    self.quad_update_count = 0;
+    for q_id in queue {
+      self.quad_flush_by_id(q_id).await?;
+    }
     Ok(())
   }
   pub async fn id_flush(&mut self) -> Result<(),Error> {
@@ -373,7 +426,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   }
   pub async fn flush(&mut self) -> Result<(),Error> {
     // todo: parallel io
-    self.quad_flush().await?;
+    self.quad_flush_all().await?;
     self.id_flush().await?;
     self.missing_flush().await?;
     Ok(())
@@ -435,9 +488,12 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let qfile = quad_file(*q_id);
     let records = self.read_quad(*q_id).await?;
     {
-      let mut s = self.open_file_rw(&qfile).await?;
-      s.set_len(0).await?;
+      let mut st = self.storage.lock().await;
+      if st.exists(&qfile).await {
+        st.remove(&qfile).await?;
+      }
     }
+    self.lock_file(&qfile).await;
     self.quad_count.insert(*q_id, 0);
     let (nx,ny) = (2,2);
     let mut quads = vec![];

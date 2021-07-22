@@ -15,6 +15,7 @@ pub trait Storage<S>: Send+Sync+Unpin where S: RW {
   async fn open_rw(&mut self, name: &str) -> Result<S,Error>;
   async fn open_r(&mut self, name: &str) -> Result<Option<S>,Error>;
   async fn remove(&mut self, name: &str) -> Result<(),Error>;
+  async fn exists(&mut self, name: &str) -> bool;
 }
 
 pub struct FileStorage {
@@ -46,6 +47,9 @@ impl Storage<fs::File> for FileStorage {
   async fn remove(&mut self, name: &str) -> Result<(),Error> {
     let p = self.path.join(name);
     fs::remove_file(p).await.map_err(|e| e.into())
+  }
+  async fn exists(&mut self, name: &str) -> bool {
+    self.path.join(name).exists().await
   }
 }
 
