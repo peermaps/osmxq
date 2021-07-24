@@ -48,6 +48,7 @@ pub struct XQ<S,R> where S: RW, R: Record {
   quad_update_age: HashMap<QuadId,usize>,
   quad_update_count: u64,
   quad_count: HashMap<QuadId,u64>,
+  quad_bbox: HashMap<QuadId,BBox>,
   next_quad_id: QuadId,
   id_cache: LruCache<RecordId,QuadId>,
   id_updates: Arc<RwLock<HashMap<IdBlock,HashMap<RecordId,QuadId>>>>,
@@ -79,8 +80,8 @@ impl Default for Fields {
   fn default() -> Self {
     Self {
       id_block_size: 500_000,
-      id_cache_size: 5_000_000,
-      id_flush_size: 5_000_000,
+      id_cache_size: 100_000_000,
+      id_flush_size: 20_000_000,
       id_flush_top: 200,
       id_flush_max_age: 40,
       quad_block_size: 50_000,
@@ -109,12 +110,16 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       quad_updates.insert(0, None);
       let mut quad_count = HashMap::new();
       quad_count.insert(0, 0);
+      let mut quad_bbox = HashMap::new();
+      quad_bbox.insert(0, (-180.0,-90.0,180.0,90.0));
+
       let xq = Self {
         storage: Mutex::new(storage),
         root: QTree::Quad {
           id: 0,
           bbox: (-180.0,-90.0,180.0,90.0),
         },
+        quad_bbox,
         active_files: HashMap::new(),
         record_cache: LruCache::new(fields.record_cache_size),
         quad_updates: Arc::new(RwLock::new(quad_updates)),
@@ -136,9 +141,11 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     } else {
       let (_,meta) = Meta::from_bytes(&buf)?;
       fields.id_block_size = meta.id_block_size;
+      let quad_bbox = Self::get_bboxes(&meta.root);
       let xq = Self {
         storage: Mutex::new(storage),
         root: meta.root,
+        quad_bbox,
         active_files: HashMap::new(),
         record_cache: LruCache::new(fields.record_cache_size),
         quad_updates: Arc::new(RwLock::new(HashMap::new())),
@@ -180,6 +187,28 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       cursors = tmp;
     }
     quad_ids
+  }
+  fn get_bboxes(root: &QTree) -> HashMap<QuadId,BBox> {
+    let mut cursors = vec![root];
+    let mut ncursors = vec![];
+    let mut bboxes = HashMap::new();
+    while !cursors.is_empty() {
+      ncursors.clear();
+      for c in cursors.iter() {
+        match c {
+          QTree::Node { children, .. } => {
+            ncursors.extend(children)
+          },
+          QTree::Quad { id, bbox } => {
+            bboxes.insert(*id, bbox.clone());
+          },
+        }
+      }
+      let tmp = ncursors;
+      ncursors = cursors;
+      cursors = tmp;
+    }
+    bboxes
   }
   pub async fn read_quad(&mut self, q_id: QuadId) -> Result<HashMap<RecordId,R>,Error> {
     let qfile = quad_file(q_id);
@@ -273,7 +302,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     if records.is_empty() { return Ok(()) }
     let qs = self.get_quads(&records).await?;
     if qs.is_empty() { return Ok(()) }
-    for (q_id,(bbox,ix)) in qs.iter() {
+    for (q_id,ix) in qs.iter() {
       for i in ix {
         let record = records.get(*i).unwrap();
         self.insert_id(record.get_id(), *q_id).await?;
@@ -301,7 +330,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         }
       }
       if self.quad_count.get(q_id).cloned().unwrap_or(0) > self.fields.quad_block_size {
-        self.split_quad(&q_id, &bbox).await?;
+        self.split_quad(&q_id).await?;
       }
     }
     self.check_flush().await?;
@@ -464,38 +493,43 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     self.missing_flush().await?;
     Ok(())
   }
-  pub async fn get_record(&mut self, id: RecordId) -> Result<Option<R>,Error> {
-    if let Some(record) = self.record_cache.get(&id).cloned() {
-      return Ok(Some(record));
-    }
+  async fn get_qid_for_id(&mut self, id: RecordId) -> Result<Option<QuadId>,Error> {
     let b = self.id_block(id);
     let mut o_q_id = self.id_updates.read().await.get(&b).and_then(|ids| ids.get(&id).copied());
     if o_q_id.is_none() {
       o_q_id = self.id_cache.get(&id).copied();
     }
-    let q_id = if let Some(q_id) = o_q_id { q_id } else {
-      let ifile = self.id_file(id);
-      let mut buf = vec![];
-      if let Some(mut s) = self.open_file_r(&ifile).await? {
-        s.read_to_end(&mut buf).await?;
+    if let Some(q_id) = o_q_id {
+      return Ok(Some(q_id));
+    }
+    let ifile = self.id_file(id);
+    let mut buf = vec![];
+    if let Some(mut s) = self.open_file_r(&ifile).await? {
+      s.read_to_end(&mut buf).await?;
+    }
+    let mut ids = HashMap::new();
+    {
+      let mut offset = 0;
+      while offset < buf.len() {
+        let s = unpack_ids(&buf[offset..], &mut ids)?;
+        offset += s;
+        if s == 0 { break }
       }
-      let mut ids = HashMap::new();
-      {
-        let mut offset = 0;
-        while offset < buf.len() {
-          let s = unpack_ids(&buf[offset..], &mut ids)?;
-          offset += s;
-          if s == 0 { break }
-        }
-      }
-      let g = ids.get(&id).copied();
-      for (r_id,q_id) in ids {
-        self.id_cache.put(r_id, q_id);
-      }
-      self.close_file(&ifile);
-      if g.is_none() { return Ok(None) }
-      g.unwrap()
-    };
+    }
+    let g = ids.get(&id).copied();
+    for (r_id,q_id) in ids {
+      self.id_cache.put(r_id, q_id);
+    }
+    self.close_file(&ifile);
+    Ok(g)
+  }
+  pub async fn get_record(&mut self, id: RecordId) -> Result<Option<R>,Error> {
+    if let Some(record) = self.record_cache.get(&id).cloned() {
+      return Ok(Some(record));
+    }
+    let o_q_id = self.get_qid_for_id(id).await?;
+    if o_q_id.is_none() { return Ok(None) }
+    let q_id = o_q_id.unwrap();
     if let Some(records) = self.quad_updates.read().await.get(&q_id) {
       if let Some(r) = records.as_ref().and_then(|items| items.get(&id).cloned()) {
         return Ok(Some(r));
@@ -538,7 +572,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let record = o_r.unwrap();
     Ok(record.get_position())
   }
-  pub async fn split_quad(&mut self, q_id: &QuadId, bbox: &BBox) -> Result<(),Error> {
+  pub async fn split_quad(&mut self, q_id: &QuadId) -> Result<(),Error> {
+    let bbox = self.quad_bbox.get(q_id).copied().unwrap();
     let qfile = quad_file(*q_id);
     let records = self.read_quad(*q_id).await?;
     {
@@ -594,6 +629,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           self.quad_count.insert(*q_id, q.1.len() as u64);
           self.quad_updates.write().await.insert(*q_id, Some(q.1));
         }
+        self.quad_bbox.insert(*q_id, q.0.clone());
         nchildren.push(QTree::Quad { id: *q_id, bbox: q.0.clone() });
       } else {
         let id = self.next_quad_id;
@@ -608,6 +644,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           self.quad_count.insert(id, q.1.len() as u64);
           self.quad_updates.write().await.insert(id, Some(q.1));
         }
+        self.quad_bbox.insert(id, q.0.clone());
         nchildren.push(QTree::Quad { id, bbox: q.0.clone() });
       }
       i += 1;
@@ -624,7 +661,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           match c {
             QTree::Node { children, .. } => {
               ncursors.extend(children.iter_mut()
-                .filter(|ch| { bbox_overlap(bbox,&ch.bbox()) })
+                .filter(|ch| { bbox_overlap(&bbox,&ch.bbox()) })
                 .collect::<Vec<_>>());
             },
             QTree::Quad { id, .. } => {
@@ -645,8 +682,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     self.check_flush().await?;
     Ok(())
   }
-  pub async fn get_quads(&mut self, records: &[R]) -> Result<HashMap<QuadId,(BBox,Vec<usize>)>,Error> {
-    let mut result: HashMap<QuadId,(BBox,Vec<usize>)> = HashMap::new();
+  async fn get_quads(&mut self, records: &[R]) -> Result<HashMap<QuadId,Vec<usize>>,Error> {
+    let mut result: HashMap<QuadId,Vec<usize>> = HashMap::new();
     let mut positions = HashMap::new();
     let mut rmap = HashMap::new();
     for r in records.iter() {
@@ -654,6 +691,18 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     }
     for (i,r) in records.iter().enumerate() {
       let mut o_p = check_position_records(r, &rmap);
+      if o_p.is_none() {
+        if let Some(f_id) = r.get_refs().first() {
+          if let Some(q_id) = self.get_qid_for_id(*f_id).await? {
+            if let Some(items) = result.get_mut(&q_id) {
+              items.push(i);
+            } else {
+              result.insert(q_id, vec![i]);
+            }
+            continue;
+          }
+        }
+      }
       if o_p.is_none() {
         o_p = self.get_position(r).await?;
       }
@@ -679,10 +728,10 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           QTree::Quad { id, bbox } => {
             positions.drain_filter(|i,p| {
               if overlap(p,bbox) {
-                if let Some((_,items)) = result.get_mut(id) {
+                if let Some(items) = result.get_mut(id) {
                   items.push(*i);
                 } else {
-                  result.insert(*id, (bbox.clone(),vec![*i]));
+                  result.insert(*id, vec![*i]);
                 }
                 true
               } else {
