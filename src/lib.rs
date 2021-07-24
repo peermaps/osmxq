@@ -1,7 +1,7 @@
 #![feature(hash_drain_filter,async_closure)]
 use std::collections::HashMap;
 use lru::LruCache;
-use async_std::{prelude::*,fs,sync::{RwLock,Arc,Mutex},io};
+use async_std::{prelude::*,fs,sync::{RwLock,Arc,Mutex}};
 use desert::{varint,ToBytes,FromBytes};
 
 mod storage;
@@ -391,30 +391,18 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     if o_ids.is_none() { return Ok(()) }
     let ids = o_ids.unwrap();
     let ifile = id_file_from_block(b);
-    let mut s = self.open_file_rw(&ifile).await?;
-    let buf = {
-      if let Some(xids) = self.id_cache.get_mut(&b) {
-        for (id,q_id) in ids.iter() {
-          xids.insert(*id, *q_id);
-        }
-        pack_ids(&xids)
-      } else {
-        let mut buf = vec![];
-        s.read_to_end(&mut buf).await?;
-        s.seek(io::SeekFrom::Start(0)).await?;
-        let mut xids = unpack_ids(&buf)?;
-        for (id,q_id) in ids.iter() {
-          xids.insert(*id,*q_id);
-        }
-        pack_ids(&xids)
-      }
-    };
-    s.set_len(buf.len() as u64).await?;
+    let mut s = self.open_file_a(&ifile).await?;
+    let buf = pack_ids(&ids);
     s.write_all(&buf).await?;
     s.flush().await?;
     self.id_update_count -= ids.len() as u64;
-    self.id_cache.put(b,ids);
+    if let Some(xids) = self.id_cache.get_mut(&b) {
+      for (id,q_id) in ids {
+        xids.insert(id, q_id);
+      }
+    }
     self.id_count.insert(b, 0);
+    self.id_update_age.insert(b, 0);
     self.close_file(&ifile);
     Ok(())
   }
@@ -493,7 +481,13 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       if let Some(mut s) = self.open_file_r(&ifile).await? {
         s.read_to_end(&mut buf).await?;
       }
-      let ids = unpack_ids(&buf)?;
+      let mut ids = HashMap::new();
+      {
+        let mut offset = 0;
+        while offset < buf.len() {
+          offset += unpack_ids(&buf, &mut ids)?;
+        }
+      }
       let g = ids.get(&id).copied();
       self.id_cache.put(b, ids);
       self.close_file(&ifile);
@@ -838,31 +832,26 @@ fn missing_file(m_id: u64) -> String {
 fn id_file_from_block(b: IdBlock) -> String {
   format!["i/{:02x}/{:x}",b%256,b/256]
 }
-fn unpack_ids(buf: &[u8]) -> Result<HashMap<RecordId,QuadId>,Error> {
-  let mut records = HashMap::new();
-  if buf.is_empty() { return Ok(records) }
+fn unpack_ids(buf: &[u8], records: &mut HashMap<RecordId,QuadId>) -> Result<usize,Error> {
+  if buf.is_empty() { return Ok(0) }
   let mut offset = 0;
-  let (s,len) = varint::decode(&buf[offset..])?;
-  offset += s;
-  for _ in 0..len {
+  while offset < buf.len() {
     let (s,r_id) = varint::decode(&buf[offset..])?;
     offset += s;
     let (s,q_id) = varint::decode(&buf[offset..])?;
     offset += s;
     records.insert(r_id, q_id);
   }
-  Ok(records)
+  Ok(offset)
 }
 fn pack_ids(records: &HashMap<RecordId,QuadId>) -> Vec<u8> {
   let mut size = 0;
-  size += varint::length(records.len() as u64);
   for (r_id,q_id) in records {
     size += varint::length(*r_id);
     size += varint::length(*q_id);
   }
   let mut buf = vec![0;size];
   let mut offset = 0;
-  offset += varint::encode(records.len() as u64, &mut buf[offset..]).unwrap();
   for (r_id,q_id) in records {
     offset += varint::encode(*r_id, &mut buf[offset..]).unwrap();
     offset += varint::encode(*q_id, &mut buf[offset..]).unwrap();
