@@ -94,7 +94,6 @@ impl Record for Feature {
   }
   fn pack(records: &HashMap<RecordId,Self>) -> Vec<u8> where Self: Sized {
     let mut size = 0;
-    size += varint::length(records.len() as u64);
     for (r_id,r) in records {
       let xid = r_id*2 + if r.position.is_some() { 1 } else { 0 };
       size += varint::length(xid);
@@ -103,7 +102,6 @@ impl Record for Feature {
     }
     let mut buf = vec![0u8;size];
     let mut offset = 0;
-    offset += varint::encode(records.len() as u64, &mut buf[offset..]).unwrap();
     for (r_id,r) in records {
       let xid = r_id*2 + if r.position.is_some() { 1 } else { 0 };
       offset += varint::encode(xid, &mut buf[offset..]).unwrap();
@@ -114,13 +112,10 @@ impl Record for Feature {
     }
     buf
   }
-  fn unpack(buf: &[u8]) -> Result<HashMap<RecordId,Self>,Error> where Self: Sized {
-    let mut records = HashMap::new();
-    if buf.is_empty() { return Ok(records) }
+  fn unpack(buf: &[u8], records: &mut HashMap<RecordId,Self>) -> Result<usize,Error> where Self: Sized {
+    if buf.is_empty() { return Ok(0) }
     let mut offset = 0;
-    let (s,record_len) = varint::decode(&buf[offset..])?;
-    offset += s;
-    for _ in 0..record_len {
+    while offset < buf.len() {
       let (s,xid) = varint::decode(&buf[offset..])?;
       offset += s;
       let id = xid/2;
@@ -134,7 +129,7 @@ impl Record for Feature {
       offset += s;
       records.insert(id, Self { id, refs, position });
     }
-    Ok(records)
+    Ok(offset)
   }
 }
 

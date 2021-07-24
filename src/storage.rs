@@ -14,6 +14,7 @@ type Error = Box<dyn std::error::Error+Send+Sync>;
 pub trait Storage<S>: Send+Sync+Unpin where S: RW {
   async fn open_rw(&mut self, name: &str) -> Result<S,Error>;
   async fn open_r(&mut self, name: &str) -> Result<Option<S>,Error>;
+  async fn open_a(&mut self, name: &str) -> Result<S,Error>;
   async fn remove(&mut self, name: &str) -> Result<(),Error>;
   async fn exists(&mut self, name: &str) -> bool;
 }
@@ -43,6 +44,11 @@ impl Storage<fs::File> for FileStorage {
     } else {
       Ok(None)
     }
+  }
+  async fn open_a(&mut self, name: &str) -> Result<fs::File,Error> {
+    let p = self.path.join(name);
+    fs::create_dir_all(p.parent().unwrap()).await?;
+    Ok(fs::OpenOptions::new().read(true).append(true).create(true).open(p).await?)
   }
   async fn remove(&mut self, name: &str) -> Result<(),Error> {
     let p = self.path.join(name);

@@ -21,7 +21,7 @@ pub trait Record: Send+Sync+Clone+std::fmt::Debug {
   fn get_refs(&self) -> Vec<RecordId>;
   fn get_position(&self) -> Option<Position>;
   fn pack(records: &HashMap<RecordId,Self>) -> Vec<u8> where Self: Sized;
-  fn unpack(buf: &[u8]) -> Result<HashMap<RecordId,Self>,Error>;
+  fn unpack(buf: &[u8], records: &mut HashMap<RecordId,Self>) -> Result<usize,Error>;
 }
 
 #[derive(Debug,Clone)]
@@ -79,15 +79,15 @@ impl Default for Fields {
   fn default() -> Self {
     Self {
       id_block_size: 500_000,
-      id_cache_size: 5_000,
-      id_flush_size: 10_000_000,
+      id_cache_size: 2_500,
+      id_flush_size: 5_000_000,
       id_flush_top: 200,
       id_flush_max_age: 40,
       quad_block_size: 50_000,
-      quad_cache_size: 2_000,
-      quad_flush_size: 10_000_000,
+      quad_cache_size: 1_000,
+      quad_flush_size: 5_000_000,
       quad_flush_top: 200,
-      quad_flush_max_age: 20,
+      quad_flush_max_age: 40,
       missing_flush_size: 2_000_000,
     }
   }
@@ -191,7 +191,12 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           Some(mut s) => {
             let mut buf = vec![];
             s.read_to_end(&mut buf).await?;
-            R::unpack(&buf)?
+            let mut rs = HashMap::new();
+            let mut offset = 0;
+            while offset < buf.len() {
+              offset += R::unpack(&buf[offset..], &mut rs)?;
+            }
+            rs
           },
           None => HashMap::new(),
         };
@@ -327,26 +332,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let rs: HashMap<u64,R> = o_rs.unwrap();
     if rs.is_empty() { return Ok(()) }
     let qfile = quad_file(q_id);
-    let mut s = self.open_file_rw(&qfile).await?;
-    let buf = {
-      if let Some(records) = self.quad_cache.get_mut(&q_id) {
-        for (r_id,r) in rs.iter() {
-          records.insert(*r_id, r.clone());
-        }
-        R::pack(&records)
-      } else {
-        let mut buf = vec![];
-        s.read_to_end(&mut buf).await?;
-        s.seek(io::SeekFrom::Start(0)).await?;
-        let mut records = R::unpack(&buf)?;
-        for (r_id,r) in rs.iter() {
-          records.insert(*r_id, r.clone());
-        }
-        self.quad_cache.put(q_id, records.clone());
-        R::pack(&records)
-      }
-    };
-    s.set_len(buf.len() as u64).await?;
+    let mut s = self.open_file_a(&qfile).await?;
+    let buf = R::pack(&rs);
     s.write_all(&buf).await?;
     s.flush().await?;
     self.close_file(&qfile);
@@ -526,7 +513,15 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     if let Some(mut s) = self.open_file_r(&qfile).await? {
       s.read_to_end(&mut buf).await?;
     }
-    let records = R::unpack(&buf)?;
+
+    let records = {
+      let mut offset = 0;
+      let mut records = HashMap::new();
+      while offset < buf.len() {
+        offset += R::unpack(&buf, &mut records)?;
+      }
+      records
+    };
     let r = records.get(&id).cloned();
     self.quad_cache.put(q_id, records);
     self.close_file(&qfile);
@@ -739,6 +734,17 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     ac.lock().await;
     st.open_rw(file).await
   }
+  async fn open_file_a(&mut self, file: &String) -> Result<S,Error> {
+    if let Some(active) = self.active_files.get(file) {
+      active.lock().await;
+    }
+    let mut st = self.storage.lock().await;
+    let active = Arc::new(Mutex::new(()));
+    let ac = active.clone();
+    self.active_files.insert(file.clone(), active);
+    ac.lock().await;
+    st.open_a(file).await
+  }
   fn close_file(&mut self, file: &String) {
     self.active_files.remove(file);
   }
@@ -757,7 +763,13 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           }
           self.close_file(&mfile);
         }
-        let mut records = R::unpack(&buf)?;
+        let mut records = HashMap::new();
+        {
+          let mut offset = 0;
+          while offset < buf.len() {
+            offset += R::unpack(&buf, &mut records)?;
+          }
+        }
         self.add_records(&records.drain().map(|(_,r)| r).collect::<Vec<R>>()).await?;
       }
       self.add_records(&m_records).await?;
