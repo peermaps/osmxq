@@ -43,7 +43,7 @@ pub struct XQ<S,R> where S: RW, R: Record {
   storage: Mutex<Box<dyn Storage<S>>>,
   active_files: HashMap<String,Arc<Mutex<()>>>,
   root: QTree,
-  quad_cache: LruCache<QuadId,HashMap<RecordId,R>>,
+  record_cache: LruCache<RecordId,R>,
   quad_updates: Arc<RwLock<HashMap<QuadId,Option<HashMap<RecordId,R>>>>>,
   quad_update_age: HashMap<QuadId,usize>,
   quad_update_count: u64,
@@ -67,8 +67,8 @@ pub struct Fields {
   pub id_flush_size: u64,
   pub id_flush_top: usize,
   pub id_flush_max_age: usize,
+  pub record_cache_size: usize,
   pub quad_block_size: u64,
-  pub quad_cache_size: usize,
   pub quad_flush_size: u64,
   pub quad_flush_top: usize,
   pub quad_flush_max_age: usize,
@@ -84,7 +84,7 @@ impl Default for Fields {
       id_flush_top: 200,
       id_flush_max_age: 40,
       quad_block_size: 50_000,
-      quad_cache_size: 1_000,
+      record_cache_size: 5_000_000,
       quad_flush_size: 5_000_000,
       quad_flush_top: 200,
       quad_flush_max_age: 40,
@@ -116,7 +116,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           bbox: (-180.0,-90.0,180.0,90.0),
         },
         active_files: HashMap::new(),
-        quad_cache: LruCache::new(fields.quad_cache_size),
+        record_cache: LruCache::new(fields.record_cache_size),
         quad_updates: Arc::new(RwLock::new(quad_updates)),
         quad_update_count: 0,
         quad_update_age: HashMap::new(),
@@ -140,7 +140,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         storage: Mutex::new(storage),
         root: meta.root,
         active_files: HashMap::new(),
-        quad_cache: LruCache::new(fields.quad_cache_size),
+        record_cache: LruCache::new(fields.record_cache_size),
         quad_updates: Arc::new(RwLock::new(HashMap::new())),
         quad_update_count: 0,
         quad_update_age: HashMap::new(),
@@ -182,31 +182,26 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     quad_ids
   }
   pub async fn read_quad(&mut self, q_id: QuadId) -> Result<HashMap<RecordId,R>,Error> {
-    let mut records = {
-      if let Some(records) = self.quad_cache.get(&q_id) {
-        records.clone()
-      } else {
-        let qfile = quad_file(q_id);
-        let records = match self.open_file_r(&qfile).await? {
-          Some(mut s) => {
-            let mut buf = vec![];
-            s.read_to_end(&mut buf).await?;
-            let mut rs = HashMap::new();
-            let mut offset = 0;
-            while offset < buf.len() {
-              let s = R::unpack(&buf[offset..], &mut rs)?;
-              offset += s;
-              if s == 0 { break }
-            }
-            rs
-          },
-          None => HashMap::new(),
-        };
-        self.quad_cache.put(q_id, records.clone());
-        self.close_file(&qfile);
-        records
-      }
+    let qfile = quad_file(q_id);
+    let mut records = match self.open_file_r(&qfile).await? {
+      Some(mut s) => {
+        let mut buf = vec![];
+        s.read_to_end(&mut buf).await?;
+        let mut rs = HashMap::new();
+        let mut offset = 0;
+        while offset < buf.len() {
+          let s = R::unpack(&buf[offset..], &mut rs)?;
+          offset += s;
+          if s == 0 { break }
+        }
+        rs
+      },
+      None => HashMap::new(),
     };
+    self.close_file(&qfile);
+    for (id,r) in records.iter() {
+      self.record_cache.put(*id, r.clone());
+    }
     if let Some(Some(xrecords)) = self.quad_updates.read().await.get(&q_id) {
       for (id,r) in xrecords {
         records.insert(*id,r.clone());
@@ -470,6 +465,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     Ok(())
   }
   pub async fn get_record(&mut self, id: RecordId) -> Result<Option<R>,Error> {
+    if let Some(record) = self.record_cache.get(&id).cloned() {
+      return Ok(Some(record));
+    }
     let b = self.id_block(id);
     let mut o_q_id = self.id_updates.read().await.get(&b).and_then(|ids| ids.get(&id).copied());
     if o_q_id.is_none() {
@@ -503,15 +501,11 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         return Ok(Some(r));
       }
     }
-    if let Some(records) = self.quad_cache.get(&q_id) {
-      return Ok(records.get(&id).cloned());
-    }
     let qfile = quad_file(q_id);
     let mut buf = vec![];
     if let Some(mut s) = self.open_file_r(&qfile).await? {
       s.read_to_end(&mut buf).await?;
     }
-
     let records = {
       let mut offset = 0;
       let mut records = HashMap::new();
@@ -523,7 +517,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       records
     };
     let r = records.get(&id).cloned();
-    self.quad_cache.put(q_id, records);
+    for (r_id,r) in records {
+      self.record_cache.put(r_id, r);
+    }
     self.close_file(&qfile);
     Ok(r)
   }
