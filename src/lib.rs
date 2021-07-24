@@ -49,7 +49,7 @@ pub struct XQ<S,R> where S: RW, R: Record {
   quad_update_count: u64,
   quad_count: HashMap<QuadId,u64>,
   next_quad_id: QuadId,
-  id_cache: LruCache<IdBlock,HashMap<RecordId,QuadId>>,
+  id_cache: LruCache<RecordId,QuadId>,
   id_updates: Arc<RwLock<HashMap<IdBlock,HashMap<RecordId,QuadId>>>>,
   id_update_age: HashMap<IdBlock,usize>,
   id_update_count: u64,
@@ -79,7 +79,7 @@ impl Default for Fields {
   fn default() -> Self {
     Self {
       id_block_size: 500_000,
-      id_cache_size: 2_500,
+      id_cache_size: 5_000_000,
       id_flush_size: 5_000_000,
       id_flush_top: 200,
       id_flush_max_age: 40,
@@ -398,10 +398,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     s.write_all(&buf).await?;
     s.flush().await?;
     self.id_update_count -= ids.len() as u64;
-    if let Some(xids) = self.id_cache.get_mut(&b) {
-      for (id,q_id) in ids {
-        xids.insert(id, q_id);
-      }
+    for (id,q_id) in ids {
+      self.id_cache.put(id,q_id);
     }
     self.id_count.insert(b, 0);
     self.id_update_age.insert(b, 0);
@@ -475,7 +473,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let b = self.id_block(id);
     let mut o_q_id = self.id_updates.read().await.get(&b).and_then(|ids| ids.get(&id).copied());
     if o_q_id.is_none() {
-      o_q_id = self.id_cache.get(&b).and_then(|ids| ids.get(&id)).copied();
+      o_q_id = self.id_cache.get(&id).copied();
     }
     let q_id = if let Some(q_id) = o_q_id { q_id } else {
       let ifile = self.id_file(id);
@@ -493,7 +491,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         }
       }
       let g = ids.get(&id).copied();
-      self.id_cache.put(b, ids);
+      for (r_id,q_id) in ids {
+        self.id_cache.put(r_id, q_id);
+      }
       self.close_file(&ifile);
       if g.is_none() { return Ok(None) }
       g.unwrap()
