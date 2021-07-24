@@ -194,7 +194,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
             let mut rs = HashMap::new();
             let mut offset = 0;
             while offset < buf.len() {
-              offset += R::unpack(&buf[offset..], &mut rs)?;
+              let s = R::unpack(&buf[offset..], &mut rs)?;
+              offset += s;
+              if s == 0 { break }
             }
             rs
           },
@@ -485,7 +487,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       {
         let mut offset = 0;
         while offset < buf.len() {
-          offset += unpack_ids(&buf, &mut ids)?;
+          let s = unpack_ids(&buf[offset..], &mut ids)?;
+          offset += s;
+          if s == 0 { break }
         }
       }
       let g = ids.get(&id).copied();
@@ -512,7 +516,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       let mut offset = 0;
       let mut records = HashMap::new();
       while offset < buf.len() {
-        offset += R::unpack(&buf, &mut records)?;
+        let s = R::unpack(&buf[offset..], &mut records)?;
+        offset += s;
+        if s == 0 { break }
       }
       records
     };
@@ -761,7 +767,9 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         {
           let mut offset = 0;
           while offset < buf.len() {
-            offset += R::unpack(&buf, &mut records)?;
+            let s = R::unpack(&buf, &mut records)?;
+            offset += s;
+            if s == 0 { break }
           }
         }
         self.add_records(&records.drain().map(|(_,r)| r).collect::<Vec<R>>()).await?;
