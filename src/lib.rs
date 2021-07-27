@@ -46,13 +46,14 @@ pub struct XQ<S,R> where S: RW, R: Record {
   record_cache: LruCache<RecordId,R>,
   quad_updates: Arc<RwLock<HashMap<QuadId,Option<HashMap<RecordId,R>>>>>,
   quad_update_age: HashMap<QuadId,usize>,
-  quad_update_count: u64,
-  quad_count: HashMap<QuadId,u64>,
+  quad_update_count_total: u64,
+  quad_update_count: HashMap<QuadId,u64>, // count of staged updates in memory
+  quad_count: HashMap<QuadId,u64>, // count of staged updates in memory+existing data on disk
   quad_bbox: HashMap<QuadId,BBox>,
   next_quad_id: QuadId,
   id_cache: LruCache<RecordId,QuadId>,
   id_updates: Arc<RwLock<HashMap<IdBlock,HashMap<RecordId,QuadId>>>>,
-  id_update_age: HashMap<IdBlock,usize>,
+  id_update_age: HashMap<IdBlock,usize>, // should be called flush age
   id_update_count: u64,
   id_count: HashMap<IdBlock,u64>,
   missing_updates: HashMap<RecordId,R>,
@@ -123,7 +124,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         active_files: HashMap::new(),
         record_cache: LruCache::new(fields.record_cache_size),
         quad_updates: Arc::new(RwLock::new(quad_updates)),
-        quad_update_count: 0,
+        quad_update_count_total: 0,
+        quad_update_count: HashMap::new(),
         quad_update_age: HashMap::new(),
         quad_count,
         id_cache: LruCache::new(fields.id_cache_size),
@@ -149,7 +151,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         active_files: HashMap::new(),
         record_cache: LruCache::new(fields.record_cache_size),
         quad_updates: Arc::new(RwLock::new(HashMap::new())),
-        quad_update_count: 0,
+        quad_update_count_total: 0,
+        quad_update_count: HashMap::new(),
         quad_update_age: HashMap::new(),
         quad_count: meta.quad_count,
         id_cache: LruCache::new(fields.id_cache_size),
@@ -322,23 +325,34 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           }
           qu.insert(*q_id, Some(items));
         }
-        self.quad_update_count += ix.len() as u64;
-        if let Some(c) = self.quad_count.get_mut(q_id) {
-          *c += ix.len() as u64;
-        } else {
-          self.quad_count.insert(*q_id, ix.len() as u64);
-        }
       }
-      if self.quad_count.get(q_id).cloned().unwrap_or(0) > self.fields.quad_block_size {
+      self.quad_add_update_count(q_id, ix.len() as u64);
+      if self.quad_get_update_count(q_id) > self.fields.quad_block_size {
         self.split_quad(&q_id).await?;
       }
     }
     self.check_flush().await?;
     Ok(())
   }
+  fn quad_add_update_count(&mut self, q_id: &QuadId, n: u64) {
+    self.quad_update_count_total += n;
+    if let Some(c) = self.quad_count.get_mut(q_id) {
+      *c += n;
+    } else {
+      self.quad_count.insert(*q_id, n);
+    }
+    if let Some(c) = self.quad_update_count.get_mut(q_id) {
+      *c += n;
+    } else {
+      self.quad_update_count.insert(*q_id, n);
+    }
+  }
+  fn quad_get_update_count(&self, q_id: &QuadId) -> u64 {
+    self.quad_count.get(q_id).cloned().unwrap_or(0)
+  }
   pub async fn check_flush(&mut self) -> Result<(),Error> {
     // todo: parallel io
-    if self.quad_update_count >= self.fields.quad_flush_size {
+    if self.quad_update_count_total >= self.fields.quad_flush_size {
       self.quad_flush_partial(self.fields.quad_flush_top).await?;
     }
     if self.id_update_count >= self.fields.id_flush_size {
@@ -363,8 +377,8 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     s.write_all(&buf).await?;
     s.flush().await?;
     self.close_file(&qfile);
-    self.quad_update_count -= rs.len() as u64;
-    self.quad_count.insert(q_id, 0);
+    self.quad_update_count_total -= rs.len() as u64;
+    self.quad_update_count.insert(q_id, 0);
     self.quad_update_age.insert(q_id, 0);
     Ok(())
   }
@@ -378,16 +392,16 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   }
   pub async fn quad_flush_partial(&mut self, n: usize) -> Result<(),Error> {
     let mut qs = self.quad_updates.read().await.keys()
-      .filter(|q_id| { self.quad_count.get(q_id).copied().unwrap_or(0) > 0 })
+      .filter(|q_id| { self.quad_get_update_count(q_id) > 0 })
       .copied()
       .collect::<Vec<QuadId>>();
     qs.sort_unstable_by(|a,b| {
-      let ca = self.quad_count.get(a).copied().unwrap_or(0);
-      let cb = self.quad_count.get(b).copied().unwrap_or(0);
+      let ca = self.quad_get_update_count(a);
+      let cb = self.quad_get_update_count(b);
       cb.cmp(&ca) // descending
     });
     for q_id in &qs[0..n.min(qs.len())] {
-      //println!["flush {} (top: {})", q_id, self.quad_count.get(q_id).copied().unwrap_or(0)];
+      //println!["flush {} (top: {})", q_id, self.quad_get_update_count(q_id)];
       self.quad_flush_by_id(*q_id).await?;
     }
     let mut queue = vec![];
@@ -448,7 +462,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       cb.cmp(&ca) // descending
     });
     for b in &qs[0..n.min(qs.len())] {
-      //println!["flush {} (top: {})", q_id, self.quad_count.get(q_id).copied().unwrap_or(0)];
+      //println!["flush {} (top: {})", q_id, self.quad_get_update_count(q_id)];
       self.id_flush_by_block(*b).await?;
     }
     let mut queue = vec![];
@@ -584,6 +598,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     }
     self.lock_file(&qfile).await;
     self.quad_count.insert(*q_id, 0);
+    self.quad_update_count.insert(*q_id, 0);
     let (nx,ny) = (2,2);
     let mut quads = vec![];
     for i in 0..nx {
@@ -625,8 +640,10 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         if q.1.is_empty() {
           self.quad_updates.write().await.insert(*q_id, None);
           self.quad_count.insert(*q_id, 0);
+          self.quad_update_count.insert(*q_id, 0);
         } else {
           self.quad_count.insert(*q_id, q.1.len() as u64);
+          self.quad_update_count.insert(*q_id, q.1.len() as u64);
           self.quad_updates.write().await.insert(*q_id, Some(q.1));
         }
         self.quad_bbox.insert(*q_id, q.0.clone());
@@ -640,8 +657,10 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         if q.1.is_empty() {
           self.quad_updates.write().await.insert(id, None);
           self.quad_count.insert(id, 0);
+          self.quad_update_count.insert(id, 0);
         } else {
           self.quad_count.insert(id, q.1.len() as u64);
+          self.quad_update_count.insert(id, q.1.len() as u64);
           self.quad_updates.write().await.insert(id, Some(q.1));
         }
         self.quad_bbox.insert(id, q.0.clone());
