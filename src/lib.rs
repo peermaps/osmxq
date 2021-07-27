@@ -1,7 +1,7 @@
 #![feature(hash_drain_filter,async_closure)]
 use std::collections::HashMap;
 use lru::LruCache;
-use async_std::{prelude::*,fs,sync::{RwLock,Arc,Mutex}};
+use async_std::{prelude::*,fs,sync::{RwLock,Arc,Mutex},task};
 use desert::{varint,ToBytes,FromBytes};
 
 mod storage;
@@ -16,7 +16,7 @@ pub type RecordId = u64;
 pub type IdBlock = u64;
 pub type Error = Box<dyn std::error::Error+Send+Sync>;
 
-pub trait Record: Send+Sync+Clone+std::fmt::Debug {
+pub trait Record: Send+Sync+Clone+std::fmt::Debug+'static {
   fn get_id(&self) -> RecordId;
   fn get_refs(&self) -> Vec<RecordId>;
   fn get_position(&self) -> Option<Position>;
@@ -40,8 +40,8 @@ impl QTree {
 
 // todo: backrefs
 pub struct XQ<S,R> where S: RW, R: Record {
-  storage: Mutex<Box<dyn Storage<S>>>,
-  active_files: HashMap<String,Arc<Mutex<()>>>,
+  storage: Arc<Mutex<Box<dyn Storage<S>>>>,
+  active_files: Arc<RwLock<HashMap<String,Arc<Mutex<()>>>>>,
   root: QTree,
   record_cache: LruCache<RecordId,R>,
   quad_updates: Arc<RwLock<HashMap<QuadId,Option<HashMap<RecordId,R>>>>>,
@@ -80,7 +80,7 @@ pub struct Fields {
 impl Default for Fields {
   fn default() -> Self {
     Self {
-      id_block_size: 500_000,
+      id_block_size: 50_000,
       id_cache_size: 100_000_000,
       id_flush_size: 20_000_000,
       id_flush_top: 200,
@@ -115,13 +115,13 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       quad_bbox.insert(0, (-180.0,-90.0,180.0,90.0));
 
       let xq = Self {
-        storage: Mutex::new(storage),
+        storage: Arc::new(Mutex::new(storage)),
         root: QTree::Quad {
           id: 0,
           bbox: (-180.0,-90.0,180.0,90.0),
         },
         quad_bbox,
-        active_files: HashMap::new(),
+        active_files: Arc::new(RwLock::new(HashMap::new())),
         record_cache: LruCache::new(fields.record_cache_size),
         quad_updates: Arc::new(RwLock::new(quad_updates)),
         quad_update_count_total: 0,
@@ -145,10 +145,10 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       fields.id_block_size = meta.id_block_size;
       let quad_bbox = Self::get_bboxes(&meta.root);
       let xq = Self {
-        storage: Mutex::new(storage),
+        storage: Arc::new(Mutex::new(storage)),
         root: meta.root,
         quad_bbox,
-        active_files: HashMap::new(),
+        active_files: Arc::new(RwLock::new(HashMap::new())),
         record_cache: LruCache::new(fields.record_cache_size),
         quad_updates: Arc::new(RwLock::new(HashMap::new())),
         quad_update_count_total: 0,
@@ -230,7 +230,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       },
       None => HashMap::new(),
     };
-    self.close_file(&qfile);
+    self.close_file(&qfile).await;
     for (id,r) in records.iter() {
       self.record_cache.put(*id, r.clone());
     }
@@ -376,19 +376,47 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let buf = R::pack(&rs);
     s.write_all(&buf).await?;
     s.flush().await?;
-    self.close_file(&qfile);
+    self.close_file(&qfile).await;
     self.quad_update_count_total -= rs.len() as u64;
     self.quad_update_count.insert(q_id, 0);
     self.quad_update_age.insert(q_id, 0);
     Ok(())
   }
-  pub async fn quad_flush_all(&mut self) -> Result<(),Error> {
-    // todo: parallel io
-    let qs = self.quad_updates.read().await.keys().copied().collect::<Vec<QuadId>>();
-    for q_id in qs {
-      self.quad_flush_by_id(q_id).await?;
+  pub async fn quad_flush_by_ids(&mut self, q_ids: &[QuadId]) -> Result<(),Error> {
+    let mut work: Vec<task::JoinHandle<Result<(QuadId,u64),Error>>> = vec![];
+    for q in q_ids {
+      let q_id = *q;
+      let active_files = self.active_files.clone();
+      let storage = self.storage.clone();
+      let quc = self.quad_updates.clone();
+      work.push(task::spawn(async move {
+        let o_rs = {
+          let mut qu = quc.write().await;
+          qu.remove(&q_id).and_then(|v| v)
+        };
+        if o_rs.is_none() { return Ok((q_id, 0)) }
+        let rs: HashMap<u64,R> = o_rs.unwrap();
+        if rs.is_empty() { return Ok((q_id, 0)) }
+        let qfile = quad_file(q_id);
+        let mut s = Self::open_file_a_params(&qfile, active_files.clone(), storage).await?;
+        let buf = R::pack(&rs);
+        s.write_all(&buf).await?;
+        s.flush().await?;
+        Self::close_file_params(&qfile, active_files).await;
+        Ok((q_id, rs.len() as u64))
+      }));
+    }
+    for r in futures::future::join_all(work).await {
+      let (q_id,n) = r?;
+      self.quad_update_count_total -= n;
+      self.quad_update_count.insert(q_id, 0);
+      self.quad_update_age.insert(q_id, 0);
     }
     Ok(())
+  }
+  pub async fn quad_flush_all(&mut self) -> Result<(),Error> {
+    let qs = self.quad_updates.read().await.keys().copied().collect::<Vec<QuadId>>();
+    self.quad_flush_by_ids(&qs).await
   }
   pub async fn quad_flush_partial(&mut self, n: usize) -> Result<(),Error> {
     let mut qs = self.quad_updates.read().await.keys()
@@ -400,10 +428,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       let cb = self.quad_get_update_count(b);
       cb.cmp(&ca) // descending
     });
-    for q_id in &qs[0..n.min(qs.len())] {
-      //println!["flush {} (top: {})", q_id, self.quad_get_update_count(q_id)];
-      self.quad_flush_by_id(*q_id).await?;
-    }
+    self.quad_flush_by_ids(&qs[0..n.min(qs.len())]).await?;
     let mut queue = vec![];
     for q_id in self.quad_updates.read().await.keys() {
       let age = {
@@ -441,7 +466,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     }
     self.id_count.insert(b, 0);
     self.id_update_age.insert(b, 0);
-    self.close_file(&ifile);
+    self.close_file(&ifile).await;
     Ok(())
   }
   pub async fn id_flush_all(&mut self) -> Result<(),Error> {
@@ -497,7 +522,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     s.write_all(&buf).await?;
     s.flush().await?;
     self.missing_updates.clear();
-    self.close_file(&mfile);
+    self.close_file(&mfile).await;
     Ok(())
   }
   pub async fn flush(&mut self) -> Result<(),Error> {
@@ -534,7 +559,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     for (r_id,q_id) in ids {
       self.id_cache.put(r_id, q_id);
     }
-    self.close_file(&ifile);
+    self.close_file(&ifile).await;
     Ok(g)
   }
   pub async fn get_record(&mut self, id: RecordId) -> Result<Option<R>,Error> {
@@ -568,7 +593,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     for (r_id,r) in records {
       self.record_cache.put(r_id, r);
     }
-    self.close_file(&qfile);
+    self.close_file(&qfile).await;
     Ok(r)
   }
   async fn get_position(&mut self, record: &R) -> Result<Option<Position>,Error> {
@@ -697,7 +722,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       }
       assert![found, "did not locate quad id={}", q_id];
     }
-    self.close_file(&qfile);
+    self.close_file(&qfile).await;
     self.check_flush().await?;
     Ok(())
   }
@@ -768,49 +793,66 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     Ok(result)
   }
   async fn lock_file(&mut self, file: &String) {
-    if let Some(active) = self.active_files.get(file) {
+    if let Some(active) = self.active_files.read().await.get(file) {
       active.lock().await;
     }
     let active = Arc::new(Mutex::new(()));
     let ac = active.clone();
-    self.active_files.insert(file.clone(), active);
+    self.active_files.write().await.insert(file.clone(), active);
     ac.lock().await;
   }
   async fn open_file_r(&mut self, file: &String) -> Result<Option<S>,Error> {
-    if let Some(active) = self.active_files.get(file) {
+    if let Some(active) = self.active_files.read().await.get(file) {
       active.lock().await;
     }
     let mut st = self.storage.lock().await;
     let active = Arc::new(Mutex::new(()));
     let ac = active.clone();
-    self.active_files.insert(file.clone(), active);
+    self.active_files.write().await.insert(file.clone(), active);
     ac.lock().await;
     st.open_r(file).await
   }
   async fn open_file_rw(&mut self, file: &String) -> Result<S,Error> {
-    if let Some(active) = self.active_files.get(file) {
+    if let Some(active) = self.active_files.read().await.get(file) {
       active.lock().await;
     }
     let mut st = self.storage.lock().await;
     let active = Arc::new(Mutex::new(()));
     let ac = active.clone();
-    self.active_files.insert(file.clone(), active);
+    self.active_files.write().await.insert(file.clone(), active);
     ac.lock().await;
     st.open_rw(file).await
   }
   async fn open_file_a(&mut self, file: &String) -> Result<S,Error> {
-    if let Some(active) = self.active_files.get(file) {
+    Self::open_file_a_params(
+      file,
+      self.active_files.clone(),
+      self.storage.clone()
+    ).await
+  }
+  async fn open_file_a_params(
+    file: &String,
+    active_files: Arc<RwLock<HashMap<String,Arc<Mutex<()>>>>>,
+    storage: Arc<Mutex<Box<dyn Storage<S>>>>,
+  ) -> Result<S,Error> {
+    if let Some(active) = active_files.read().await.get(file) {
       active.lock().await;
     }
-    let mut st = self.storage.lock().await;
+    let mut st = storage.lock().await;
     let active = Arc::new(Mutex::new(()));
     let ac = active.clone();
-    self.active_files.insert(file.clone(), active);
+    active_files.write().await.insert(file.clone(), active);
     ac.lock().await;
     st.open_a(file).await
   }
-  fn close_file(&mut self, file: &String) {
-    self.active_files.remove(file);
+  async fn close_file(&mut self, file: &String) {
+    Self::close_file_params(file, self.active_files.clone()).await
+  }
+  async fn close_file_params(
+    file: &String,
+    active_files: Arc<RwLock<HashMap<String,Arc<Mutex<()>>>>>,
+  ) {
+    active_files.write().await.remove(file);
   }
   pub async fn finish(&mut self) -> Result<(),Error> {
     let mut prev_count = 0;
@@ -825,7 +867,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
           if let Some(mut s) = self.open_file_r(&mfile).await? {
             s.read_to_end(&mut buf).await?;
           }
-          self.close_file(&mfile);
+          self.close_file(&mfile).await;
         }
         let mut records = HashMap::new();
         {
@@ -871,7 +913,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let buf = self.get_meta().to_bytes()?;
     s.set_len(buf.len() as u64).await?;
     s.write_all(&buf).await?;
-    self.close_file(&mfile);
+    self.close_file(&mfile).await;
     Ok(())
   }
   fn id_block(&self, id: RecordId) -> IdBlock {
