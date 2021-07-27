@@ -51,7 +51,7 @@ pub struct XQ<S,R> where S: RW, R: Record {
   quad_count: HashMap<QuadId,u64>, // count of staged updates in memory+existing data on disk
   quad_bbox: HashMap<QuadId,BBox>,
   next_quad_id: QuadId,
-  id_cache: LruCache<RecordId,QuadId>,
+  id_cache: Arc<Mutex<LruCache<RecordId,QuadId>>>,
   id_updates: Arc<RwLock<HashMap<IdBlock,HashMap<RecordId,QuadId>>>>,
   id_update_age: HashMap<IdBlock,usize>, // should be called flush age
   id_update_count_total: u64,
@@ -128,7 +128,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         quad_update_count: HashMap::new(),
         quad_update_age: HashMap::new(),
         quad_count,
-        id_cache: LruCache::new(fields.id_cache_size),
+        id_cache: Arc::new(Mutex::new(LruCache::new(fields.id_cache_size))),
         id_updates: Arc::new(RwLock::new(HashMap::new())),
         id_update_age: HashMap::new(),
         id_update_count_total: 0,
@@ -155,7 +155,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
         quad_update_count: HashMap::new(),
         quad_update_age: HashMap::new(),
         quad_count: meta.quad_count,
-        id_cache: LruCache::new(fields.id_cache_size),
+        id_cache: Arc::new(Mutex::new(LruCache::new(fields.id_cache_size))),
         id_updates: Arc::new(RwLock::new(HashMap::new())),
         id_update_age: HashMap::new(),
         id_update_count_total: 0,
@@ -460,8 +460,11 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     s.write_all(&buf).await?;
     s.flush().await?;
     self.id_update_count_total -= ids.len() as u64;
-    for (id,q_id) in ids {
-      self.id_cache.put(id,q_id);
+    {
+      let mut ic = self.id_cache.lock().await;
+      for (id,q_id) in ids {
+        ic.put(id,q_id);
+      }
     }
     self.id_update_count.insert(b, 0);
     self.id_update_age.insert(b, 0);
@@ -492,8 +495,11 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     for r in futures::future::join_all(work).await {
       let (b,ids) = r?;
       self.id_update_count_total -= ids.len() as u64;
-      for (id,q_id) in ids {
-        self.id_cache.put(id,q_id);
+      {
+        let mut ic = self.id_cache.lock().await;
+        for (id,q_id) in ids {
+          ic.put(id,q_id);
+        }
       }
       self.id_update_count.insert(b, 0);
       self.id_update_age.insert(b, 0);
@@ -560,7 +566,7 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     let b = self.id_block(id);
     let mut o_q_id = self.id_updates.read().await.get(&b).and_then(|ids| ids.get(&id).copied());
     if o_q_id.is_none() {
-      o_q_id = self.id_cache.get(&id).copied();
+      o_q_id = self.id_cache.lock().await.get(&id).copied();
     }
     if let Some(q_id) = o_q_id {
       return Ok(Some(q_id));
@@ -580,11 +586,66 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
       }
     }
     let g = ids.get(&id).copied();
-    for (r_id,q_id) in ids {
-      self.id_cache.put(r_id, q_id);
+    {
+      let mut ic = self.id_cache.lock().await;
+      for (r_id,q_id) in ids {
+        ic.put(r_id, q_id);
+      }
     }
     self.close_file(&ifile).await;
     Ok(g)
+  }
+  async fn get_qid_for_ids(&mut self, ids: &[RecordId]) -> Result<HashMap<RecordId,QuadId>,Error> {
+    let mut work: Vec<task::JoinHandle<
+      Result<Option<(RecordId,QuadId)>,Error>
+    >> = Vec::with_capacity(ids.len());
+    for xid in ids {
+      let id = *xid;
+      let b = self.id_block(id);
+      let ic = self.id_cache.clone();
+      let iu = self.id_updates.clone();
+      let ifile = self.id_file(id);
+      let active_files = self.active_files.clone();
+      let storage = self.storage.clone();
+      work.push(task::spawn(async move {
+        let mut o_q_id = iu.read().await.get(&b).and_then(|ids| ids.get(&id).copied());
+        if o_q_id.is_none() {
+          o_q_id = ic.lock().await.get(&id).copied();
+        }
+        if let Some(q_id) = o_q_id {
+          return Ok(Some((id,q_id)));
+        }
+        let mut buf = vec![];
+        if let Some(mut s) = Self::open_file_r_params(&ifile, active_files.clone(), storage).await? {
+          s.read_to_end(&mut buf).await?;
+        }
+        let mut ids = HashMap::new();
+        {
+          let mut offset = 0;
+          while offset < buf.len() {
+            let s = unpack_ids(&buf[offset..], &mut ids)?;
+            offset += s;
+            if s == 0 { break }
+          }
+        }
+        let g = ids.get(&id).copied();
+        {
+          let mut icl = ic.lock().await;
+          for (r_id,q_id) in ids {
+            icl.put(r_id, q_id);
+          }
+        }
+        Self::close_file_params(&ifile, active_files).await;
+        Ok(g.map(|q_id| (id,q_id)))
+      }));
+    }
+    let mut results = HashMap::new();
+    for r in futures::future::join_all(work).await {
+      if let Some((r_id,q_id)) = r? {
+        results.insert(r_id, q_id);
+      }
+    }
+    Ok(results)
   }
   pub async fn get_record(&mut self, id: RecordId) -> Result<Option<R>,Error> {
     if let Some(record) = self.record_cache.get(&id).cloned() {
@@ -753,34 +814,55 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
   async fn get_quads(&mut self, records: &[R]) -> Result<HashMap<QuadId,Vec<usize>>,Error> {
     let mut result: HashMap<QuadId,Vec<usize>> = HashMap::new();
     let mut positions = HashMap::new();
+
     let mut rmap = HashMap::new();
     for r in records.iter() {
       rmap.insert(r.get_id(), r.clone());
     }
-    for (i,r) in records.iter().enumerate() {
-      let mut o_p = check_position_records(r, &rmap);
-      if o_p.is_none() {
+
+    let mut get_qids = vec![];
+    {
+      let mut ic = self.id_cache.lock().await;
+      let iu = self.id_updates.read().await;
+      for (i,r) in records.iter().enumerate() {
+        let id = r.get_id();
+        let b = self.id_block(id);
+        let mut o_q_id = iu.get(&b).and_then(|ids| ids.get(&id).copied());
+        if o_q_id.is_none() {
+          o_q_id = ic.get(&id).copied();
+        }
+        if let Some(q_id) = o_q_id {
+          if let Some(items) = result.get_mut(&q_id) {
+            items.push(i);
+          } else {
+            result.insert(q_id, vec![i]);
+          }
+        } else if let Some(p) = check_position_records(r, &rmap) {
+          positions.insert(i,p);
+        } else if let Some(f_id) = r.get_refs().first() {
+          get_qids.push(*f_id);
+        }
+      }
+    }
+    {
+      let qids = self.get_qid_for_ids(&get_qids).await?;
+      for (i,r) in records.iter().enumerate() {
+        if positions.contains_key(&i) { continue }
         if let Some(f_id) = r.get_refs().first() {
-          if let Some(q_id) = self.get_qid_for_id(*f_id).await? {
+          if let Some(q_id) = qids.get(&f_id) {
             if let Some(items) = result.get_mut(&q_id) {
               items.push(i);
             } else {
-              result.insert(q_id, vec![i]);
+              result.insert(*q_id, vec![i]);
             }
-            continue;
+          } else {
+            self.missing_updates.insert(r.get_id(),r.clone());
+            self.missing_count += 1;
           }
         }
       }
-      if o_p.is_none() {
-        o_p = self.get_position(r).await?;
-      }
-      if let Some(p) = o_p {
-        positions.insert(i,p);
-      } else {
-        self.missing_updates.insert(r.get_id(),r.clone());
-        self.missing_count += 1;
-      }
     }
+
     let mut cursors = vec![&self.root];
     let mut ncursors = vec![];
     while !cursors.is_empty() {
@@ -826,13 +908,20 @@ impl<S,R> XQ<S,R> where S: RW, R: Record {
     ac.lock().await;
   }
   async fn open_file_r(&mut self, file: &String) -> Result<Option<S>,Error> {
-    if let Some(active) = self.active_files.read().await.get(file) {
+    Self::open_file_r_params(file, self.active_files.clone(), self.storage.clone()).await
+  }
+  async fn open_file_r_params(
+    file: &String,
+    active_files: Arc<RwLock<HashMap<String,Arc<Mutex<()>>>>>,
+    storage: Arc<Mutex<Box<dyn Storage<S>>>>,
+  ) -> Result<Option<S>,Error> {
+    if let Some(active) = active_files.read().await.get(file) {
       active.lock().await;
     }
-    let mut st = self.storage.lock().await;
+    let mut st = storage.lock().await;
     let active = Arc::new(Mutex::new(()));
     let ac = active.clone();
-    self.active_files.write().await.insert(file.clone(), active);
+    active_files.write().await.insert(file.clone(), active);
     ac.lock().await;
     st.open_r(file).await
   }
